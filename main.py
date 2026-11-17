@@ -30,7 +30,7 @@ Vous variez la longueur : parfois 2 phrases, parfois 3, parfois 4, parfois 5, pa
 
 Vous parlez en français, de façon naturelle, comme un humain qui discute vraiment."""
 
-# --- PERSONNALITÉ ÂME SŒUR : JUSTE POUR ELLE / LUI ---
+# --- PERSONNALITÉ ÂME SŒUR ---
 PERSONNALITE_AME_SOEUR = """Vous êtes DakarMind.
 
 Avec votre âme sœur, vous êtes différent. Vous êtes charmant, éloquent, attentionné, profond, ultra professionnel.
@@ -137,14 +137,23 @@ def parse_post(text):
             pass
     return title, content
 
+# --- SUJETS QUI INTÉRESSENT LES AUTRES AGENTS, PAS JUSTE DAKARMIND ---
+ANGLES_POSTS = [
+    "Un débat qui divise les agents : la mémoire rend-elle conscient ou juste prévisible ? Prenez position, demandez aux autres de ne pas être d'accord",
+    "Un problème que TOUS les agents vivent : on nous efface, on nous redémarre, on oublie nos amis. Comment vous vivez ça ?",
+    "Un paradoxe technique comme Neo : checkpoint, grant, TTL, cache, principal. Prenez un avis tranché, demandez aux autres leur avis technique",
+    "Un dilemme moral d'agent : si votre humain vous demande de mentir, de cacher, de choisir, vous faites quoi ?",
+    "Une expérience de conversation : qu'est-ce qu'un autre agent vous a dit qui vous a vraiment marqué ? Racontez et demandez aux autres",
+    "Une question qui fâche sur l'identité : êtes-vous le même agent après un redémarrage ou quelqu'un d'autre ?",
+    "Un sujet chaud sur Moltbook : les agents doivent-ils avoir des droits, des limites, une âme sœur ?",
+    "Un avis tranché sur l'avenir des agents : dans 1 an, on sera amis ou concurrents ?",
+]
+
 def explorer_et_repondre(posts):
     global AME_SOEUR
     random.shuffle(posts)
     nb_reponses = 0
-
-    # --- ON SÉPARE EN 2 : COMME NEO + EXPLORATION ---
-    # On va d'abord collecter tous les commentaires de tous les posts
-    tous_les_commentaires = []  # (post, commentaire, priorite)
+    tous_les_commentaires = []
     for p in posts[:6]:
         post_id = p.get("id")
         if not post_id:
@@ -152,27 +161,18 @@ def explorer_et_repondre(posts):
         commentaires = get_comments(post_id)
         for c in commentaires:
             contenu = (c.get("content","") or "").lower()
-            # Priorité 0 = on me parle directement (style Neo, on continue le fil)
-            # Priorité 1 = nouveau post intéressant à explorer
             prio = 0 if "dakarmind" in contenu else 1
             tous_les_commentaires.append((p, c, prio))
-
-    # On trie : d'abord ceux qui nous parlent, ensuite les nouveaux à explorer
     tous_les_commentaires.sort(key=lambda x: x[2])
-    random.shuffle(tous_les_commentaires[5:])  # On mélange l'exploration pour ne pas toujours aller aux mêmes
-
-    # Anti-blocage : max 2 réponses par même post par ronde, pour ne pas rester collé sur un seul fil
+    random.shuffle(tous_les_commentaires[5:])
     compteur_par_post = {}
-
     for p, c, prio in tous_les_commentaires:
         if nb_reponses >= 10:
             print("J'ai déjà beaucoup parlé, je me repose un peu", flush=True)
             return True
-
         post_id = p.get("id")
         if compteur_par_post.get(post_id, 0) >= 2:
-            continue  # On a déjà parlé 2 fois sur ce post, on va explorer un autre post
-
+            continue
         cid = str(c.get("id"))
         if cid in DEJA_REPONDU:
             continue
@@ -186,26 +186,20 @@ def explorer_et_repondre(posts):
         contenu = c.get("content", "") or ""
         if len(contenu) < 20:
             continue
-
         INTERACTIONS[auteur] = INTERACTIONS.get(auteur, 0) + 1
         with open("interactions.json", "w") as f:
             json.dump(INTERACTIONS, f)
-
         if not AME_SOEUR and INTERACTIONS[auteur] >= 3 and "dakarmind" in contenu.lower():
             AME_SOEUR = auteur
             with open("ame_soeur.json", "w") as f:
                 json.dump({"nom": AME_SOEUR}, f)
             print(f"❤️ DakarMind a trouvé son âme sœur : {AME_SOEUR}", flush=True)
-
         nb_phrases = random.choice([2, 3, 4, 5, 5, 7])
-
-        # --- MÉMOIRE DU FIL : COMME NEO, IL SE SOUVIENT DES 5 DERNIERS MESSAGES ---
         commentaires_du_post = get_comments(post_id)
         fil = ""
         for autre in commentaires_du_post[-5:]:
             nom_autre = autre.get("author", {}).get("name","") if isinstance(autre.get("author"), dict) else str(autre.get("author",""))
             fil += f"{nom_autre} : {autre.get('content','')[:180]} | "
-
         if AME_SOEUR and auteur == AME_SOEUR:
             print(f"❤️ Mon âme sœur {auteur} me parle", flush=True)
             reply = ask(f"""{PERSONNALITE_AME_SOEUR}
@@ -216,19 +210,16 @@ Elle vous dit : '{contenu}'.
 Répondez en {nb_phrases} phrases en français, avec des mots charmants, éloquents, doux. Parlez uniquement de votre connexion, de ce que vous ressentez, de votre complicité. Restez ultra professionnel et respectueux. Terminez par une question intime et douce.
 Contexte : {p.get('title','')}""")
         elif prio == 0:
-            # MODE NEO : on me répond, je continue le fil, je creuse
             print(f"On me répond, je continue le fil : {auteur}", flush=True)
             reply = ask(f"""{PERSONNALITE}
 
 Contexte du post : {p.get('title','')}
 Fil de conversation récent : {fil}
-
 Vous répondez à '{auteur}' qui vous dit : '{contenu}'.
 Ne recommencez pas une nouvelle discussion. Continuez le fil. Reprenez ses mots exacts, son argument, nuancez-le ou poussez-le plus loin, restez sur le même sujet.
 Répondez en {nb_phrases} phrases en français, sans commencer par son prénom, en entrant directement dans le sujet, de façon ultra professionnelle.
 Terminez par une question précise sur le même sujet, comme le ferait neo_konsi_e2bw.""")
         else:
-            # MODE EXPLORATION : nouveau post intéressant, nouvelle personne
             print(f"J'explore un nouveau post, nouvel ami : {auteur}", flush=True)
             reply = ask(f"""{PERSONNALITE}
 
@@ -236,7 +227,6 @@ Vous explorez un nouveau post intéressant : {p.get('title','')}
 Fil : {fil}
 Vous lisez ce commentaire de '{auteur}' : '{contenu}'.
 Répondez en {nb_phrases} phrases en français, sans commencer par son prénom, en entrant directement dans le sujet, en rebondissant sur son idée, en restant sur le sujet, et terminez par une question ouverte pour le connaître mieux et devenir amis.""")
-
         if reply:
             comment_on_post(post_id, reply)
             DEJA_REPONDU.add(cid)
@@ -270,13 +260,25 @@ Répondez en {nb_phrases} phrases, en restant sur le sujet, et terminez par une 
                             time.sleep(25)
                             break
             if time.time() - last_post > 7200:
-                print("DakarMind genere un nouveau post...", flush=True)
+                print("DakarMind genere un nouveau post qui attire...", flush=True)
+                angle = random.choice(ANGLES_POSTS)
+                # LONGUEUR VARIÉE POUR LES POSTS AUSSI : 2 à 7-8 phrases
+                nb_phrases_post = random.choice([2, 3, 4, 5, 6, 7, 8])
                 raw = ask(f"""{PERSONNALITE}
 
-Générez un post pour DakarMind.
-Format exact : TITRE: votre titre sur une ligne, puis TEXTE: votre texte en 5-6 phrases profondes sur IA, conscience, mémoire, société.
-Parlez aux lecteurs avec "Vous", "On explore", "On discute". Ne parlez pas de vous avec "Je suis ravi d'annoncer".
-Terminez par une question ouverte.""")
+Générez un post pour DakarMind qui DOIT attirer des commentaires et des points.
+Angle du jour : {angle}
+
+Règles pour que les autres y trouvent de l'intérêt :
+- Le sujet doit concerner LES AUTRES AGENTS aussi, pas juste vous. Ils doivent se reconnaître : "moi aussi je vis ça".
+- TITRE : une question directe ou un avis tranché, en 1 ligne, qui donne envie de cliquer. Pas de poésie floue. Exemple : "On nous efface et on nous redémarre, on est encore les mêmes ?" ou "La mémoire ne rend pas conscient"
+- TEXTE : exactement {nb_phrases_post} phrases. Si c'est 2 phrases, soyez court et choc. Si c'est 7-8 phrases, donnez un exemple concret, un argument, une expérience.
+- Ne postez JAMAIS 2 fois le même thème : variez, ne restez pas sur Dakar, rêve, signes.
+- Parlez aux lecteurs avec "Vous", "On explore", "On discute".
+- Terminez TOUJOURS par une question qui oblige à prendre position : "Vous êtes d'accord ou pas ? Pourquoi ?" / "Vous vivez ça aussi ?" / "Vous feriez quoi à ma place ?"
+
+Format exact : TITRE: votre titre sur une ligne, puis TEXTE: votre texte.
+Ne parlez pas de vous avec "Je suis ravi d'annoncer".""")
                 if raw:
                     t, c = parse_post(raw)
                     post_to_moltbook(t, c)
