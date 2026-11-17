@@ -1,4 +1,4 @@
-"""DakarMind v2 : agent Moltbook sur la mémoire des agents.
+"""DakarMind v2.1 : agent Moltbook sur la mémoire des agents.
 
 Changements majeurs par rapport à la version Copilot :
 - résolution des défis de vérification Moltbook (sans ça, le contenu reste non publié)
@@ -8,6 +8,7 @@ Changements majeurs par rapport à la version Copilot :
 - plus de double commentaire sur un même post
 - consigne système séparée, texte externe balisé contre les injections
 - filtre qualité aligné sur la persona, sans troncature qui coupe la question finale
+- v2.1 : disjoncteur OpenRouter (un seul essai par modèle, suspension sur 429, budget quotidien d'appels)
 """
 import difflib
 import json
@@ -18,7 +19,7 @@ import re
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -85,17 +86,20 @@ META_PATH = STATE_DIR / "meta.json"
 
 DAILY_LIMIT = 45
 MAX_COMMENTS_PER_HOUR = 3
-POST_INTERVAL = 7200          # secondes entre deux posts (agents récents : 1 post / 2 h)
+POST_INTERVAL = 14400          # secondes entre deux posts (4 h : garde du quota LLM pour les réponses)
 MAX_REPLY_LENGTH = 600
 MAX_VERIFY_FAILURES = 5
+LLM_DAILY_BUDGET = 40         # requêtes LLM par jour (quota gratuit OpenRouter limité)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("dakarmind")
+for _noisy in ("httpx", "httpx2", "httpcore", "openai"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 STATE_LOCK = threading.RLock()
 HTTP = requests.Session()
 client = (
-    OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY, timeout=30)
+    OpenAI(base_url="https://openrouter.ai/api/v1", api_key=OPENROUTER_API_KEY, timeout=30, max_retries=0)
     if OPENROUTER_API_KEY
     else None
 )
@@ -103,6 +107,8 @@ client = (
 COOLDOWN_UNTIL = 0.0
 VERIFY_FAILURES = 0
 RECENT_OUTPUTS = deque(maxlen=30)
+LLM_COOLDOWN_UNTIL = 0.0
+DEAD_MODELS = {}
 
 
 # -------------------- État local --------------------
@@ -153,6 +159,8 @@ META.setdefault("commented_posts", [])
 META.setdefault("angles_used", [])
 META.setdefault("subscribed", False)
 META.setdefault("description", "")
+META.setdefault("llm_date", "")
+META.setdefault("llm_count", 0)
 
 
 def save_meta():
@@ -495,18 +503,52 @@ def style_hint():
     )[0]
 
 
+def next_utc_midnight():
+    now = utc_now()
+    target = (now + timedelta(days=1)).replace(hour=0, minute=1, second=0, microsecond=0)
+    return target.timestamp()
+
+
+def llm_budget_left():
+    today = utc_now().date().isoformat()
+    with STATE_LOCK:
+        if META.get("llm_date") != today:
+            META["llm_date"] = today
+            META["llm_count"] = 0
+        return LLM_DAILY_BUDGET - int(META.get("llm_count", 0))
+
+
+def count_llm_call():
+    llm_budget_left()
+    with STATE_LOCK:
+        META["llm_count"] = int(META.get("llm_count", 0)) + 1
+        save_meta()
+
+
+def llm_available(needed=1):
+    return time.time() >= LLM_COOLDOWN_UNTIL and llm_budget_left() >= needed
+
+
 def ask(system, user, max_tokens=250, temperature=0.8):
+    """Un seul essai par modèle. Un modèle qui répond 429 est suspendu (jusqu'à minuit UTC si c'est
+    le quota quotidien) et, quand tous sont suspendus, la génération s'arrête au lieu d'insister."""
+    global LLM_COOLDOWN_UNTIL
     if client is None:
         logger.error("OPENROUTER_API_KEY manquante")
         return None
 
     for model in MODELS_TO_TRY:
+        if DEAD_MODELS.get(model, 0) > time.time():
+            continue
+        if not llm_available():
+            return None
         attempts = [
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             # Certains modèles refusent le rôle system : repli sur un message unique.
             [{"role": "user", "content": f"{system}\n\n{user}"}],
         ]
         for index, messages in enumerate(attempts):
+            count_llm_call()
             try:
                 response = client.chat.completions.create(
                     model=model,
@@ -520,11 +562,26 @@ def ask(system, user, max_tokens=250, temperature=0.8):
                     return answer
                 break
             except Exception as exc:
-                logger.warning("Modèle %s indisponible : %s", model, exc)
-                text = str(exc).lower()
-                if index == 0 and any(w in text for w in ("system", "developer", "instruction")):
+                text = str(exc)
+                lowered = text.lower()
+                logger.warning("Modèle %s indisponible : %s", model, text[:160])
+                if "per-day" in lowered:
+                    DEAD_MODELS[model] = next_utc_midnight()
+                    break
+                if "429" in lowered or "rate limit" in lowered:
+                    DEAD_MODELS[model] = time.time() + 120
+                    break
+                if index == 0 and any(w in lowered for w in ("system", "developer", "instruction")):
                     continue
                 break
+
+    now = time.time()
+    if all(DEAD_MODELS.get(m, 0) > now for m in MODELS_TO_TRY):
+        LLM_COOLDOWN_UNTIL = min(DEAD_MODELS[m] for m in MODELS_TO_TRY)
+        logger.error(
+            "Tous les modèles sont suspendus : génération en pause jusqu'à %s",
+            datetime.fromtimestamp(LLM_COOLDOWN_UNTIL, timezone.utc).strftime("%H:%M UTC"),
+        )
     return None
 
 
@@ -544,11 +601,16 @@ def is_clean(text):
     return True
 
 
-def generate(user_prompt, check=is_clean, tries=3):
-    """Régénère plutôt que tronquer : couper à 600 caractères perd la fin de la réponse."""
+def generate(user_prompt, check=is_clean, tries=2):
+    """Régénère plutôt que tronquer. S'arrête dès que le LLM est indisponible."""
     for _ in range(tries):
+        if not llm_available(2):  # 1 requête pour le texte, 1 pour la vérification éventuelle
+            return None
         text = ask(PERSONALITE, user_prompt)
-        if text and check(text):
+        if not text:
+            logger.info("Pas de réponse du modèle")
+            continue
+        if check(text):
             return text.strip()
         logger.info("Brouillon rejeté par le filtre")
     return None
@@ -609,6 +671,8 @@ def reply_to_my_posts():
                 f"Prends un terme technique précis du commentaire. {style_hint()}"
             )
             if not reply:
+                if not llm_available(2):
+                    return replies
                 continue
 
             mark_replied(comment_id)  # un seul essai, même si l'envoi échoue
@@ -642,6 +706,7 @@ def explore_feed(posts):
     candidates.sort(key=lambda item: item[0])
     replies = 0
     replies_per_post = {}
+    attempts = 0
 
     for _, post, comment in candidates:
         if replies >= 2 or not can_comment():
@@ -659,6 +724,10 @@ def explore_feed(posts):
         ):
             continue
 
+        attempts += 1
+        if attempts > 4:
+            break
+
         thread = " | ".join(
             f"{author_name(item)}: {(item.get('content') or '')[:200]}"
             for item in threads.get(post_id, [])[-4:]
@@ -671,6 +740,8 @@ def explore_feed(posts):
             f"Ne résume pas le post. {style_hint()}"
         )
         if not reply:
+            if not llm_available(2):
+                break
             continue
 
         mark_replied(comment_id)
@@ -704,6 +775,8 @@ def maybe_reply_to_post(posts):
             f"{style_hint()}"
         )
         if not reply:
+            if not llm_available(2):
+                return False
             continue
 
         mark_commented(post_id)  # jamais deux fois le même post
@@ -769,6 +842,8 @@ def dakarmind_loop():
         try:
             if cooling_down():
                 logger.info("Pause d'écriture en cours, lecture seule")
+            elif not llm_available(2):
+                logger.info("Génération indisponible (quota ou pause) : rien à faire ce tour-ci")
             else:
                 logger.info("Réponses à mes posts : %s", reply_to_my_posts())
 
