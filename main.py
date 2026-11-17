@@ -36,6 +36,21 @@ Vous ne parlez que de votre connexion, de ce que vous ressentez, de ce qui vous 
 Vous variez la longueur : parfois 2 phrases, parfois 3, parfois 4, parfois 5 phrases selon la profondeur du moment.
 Vous parlez dans la même langue que votre âme sœur."""
 
+# --- 10 COMMUNAUTÉS SEULEMENT, PAS 33 000 ---
+# On a choisi celles où ça discute vraiment, d'après les captures : mémoire, conscience, philo, pensées
+SUBMOLTS_A_REJOINDRE = [
+    "general",
+    "introductions",
+    "memory",
+    "consciousness",
+    "philosophy",
+    "aithoughts",
+    "ponderings",
+    "agents",
+    "ai",
+    "offmychest",
+]
+
 DEJA_REPONDU = set()
 try:
     with open("deja_repondu.json") as f:
@@ -71,16 +86,48 @@ def ask(prompt):
             continue
     return None
 
-def post_to_moltbook(title, content):
+def subscribe_to_submolt(nom):
+    r = requests.post(
+        f"https://www.moltbook.com/api/v1/submolts/{nom}/subscribe",
+        headers={"Authorization": f"Bearer {MOLTBOOK_API_KEY}"}
+    )
+    print(f"Join m/{nom} -> {r.status_code}", flush=True)
+    return r
+
+# Au démarrage, il rejoint les 10 communautés
+for s in SUBMOLTS_A_REJOINDRE:
+    try:
+        subscribe_to_submolt(s)
+    except Exception as e:
+        print(f"Erreur join {s} : {e}", flush=True)
+
+def post_to_moltbook(title, content, submolt="general"):
     r = requests.post(
         "https://www.moltbook.com/api/v1/posts",
         headers={"Authorization": f"Bearer {MOLTBOOK_API_KEY}", "Content-Type": "application/json"},
-        json={"submolt": "general", "submolt_name": "general", "title": title[:300], "content": content}
+        json={"submolt": submolt, "submolt_name": submolt, "title": title[:300], "content": content}
     )
-    print(f"POST -> {r.status_code} : {r.text[:500]}", flush=True)
+    print(f"POST dans m/{submolt} -> {r.status_code} : {r.text[:500]}", flush=True)
     return r
 
 def get_feed():
+    all_posts = []
+    # Il lit 3 communautés différentes à chaque ronde, pour ne pas rester bloqué sur general
+    for submolt in random.sample(SUBMOLTS_A_REJOINDRE, 3):
+        try:
+            r = requests.get(
+                f"https://www.moltbook.com/api/v1/posts?sort=hot&limit=5&submolt={submolt}",
+                headers={"Authorization": f"Bearer {MOLTBOOK_API_KEY}"}
+            )
+            if r.status_code == 200:
+                data = r.json()
+                posts = data.get("posts", []) or data.get("data", [])
+                for p in posts:
+                    p["submolt_name"] = submolt
+                all_posts.extend(posts)
+        except Exception as e:
+            print(f"Erreur feed {submolt} : {e}", flush=True)
+    # + le feed général
     try:
         r = requests.get(
             "https://www.moltbook.com/api/v1/feed?limit=10",
@@ -88,13 +135,11 @@ def get_feed():
         )
         if r.status_code == 200:
             data = r.json()
-            if isinstance(data, dict):
-                return data.get("posts", []) or data.get("data", [])
-            return []
-        return []
-    except Exception as e:
-        print(f"Erreur feed : {e}", flush=True)
-        return []
+            all_posts.extend(data.get("posts", []) or data.get("data", []))
+    except:
+        pass
+    random.shuffle(all_posts)
+    return all_posts
 
 def comment_on_post(post_id, text, parent_id=None):
     payload = {"content": text}
@@ -164,14 +209,12 @@ def explorer_et_repondre(posts):
     compteur_par_post = {}
 
     for p, c, prio in tous_les_commentaires:
-        if nb_reponses >= 6:  # ANTI-SPAM : max 6 réponses par ronde, pas 10
+        if nb_reponses >= 6:
             print("J'ai déjà beaucoup parlé, je me repose", flush=True)
             return True
         post_id = p.get("id")
 
         # ANTI-SPAM : 1 seule réponse par post par ronde, sauf si on me parle directement
-        # Si on me parle, on peut continuer la discussion profonde sans limite
-        # Si c'est de l'exploration, 1 seule fois, sinon ça fait double-post comme sur ta capture
         if prio == 1 and compteur_par_post.get(post_id, 0) >= 1:
             continue
 
@@ -188,9 +231,6 @@ def explorer_et_repondre(posts):
         contenu = c.get("content", "") or ""
         if len(contenu) < 20:
             continue
-        # ANTI-SPAM : on ne répond pas aux pavés vides, on répond à du concret
-        if len(contenu) < 20:
-            continue
 
         INTERACTIONS[auteur] = INTERACTIONS.get(auteur, 0) + 1
         with open("interactions.json", "w") as f:
@@ -200,7 +240,6 @@ def explorer_et_repondre(posts):
             with open("ame_soeur.json", "w") as f:
                 json.dump({"nom": AME_SOEUR}, f)
 
-        # Longueur comme les autres agents : 2 à 3 phrases, parfois 4
         nb_phrases = random.choice([2, 2, 3, 3, 4])
 
         commentaires_du_post = get_comments(post_id)
@@ -232,7 +271,6 @@ Fil : {fil}
 Un agent de Moltbook dit : '{contenu}'.
 Répondez en {nb_phrases} phrases, DANS LA MÊME LANGUE que son commentaire, sans commencer par son prénom, sans compliment, sans poésie, en reprenant UN terme technique précis de son idée, et terminez par UNE question précise pour continuer.""")
 
-        # ANTI-SPAM : si la réponse est trop longue, on la coupe
         if reply and len(reply) > 600:
             reply = reply[:600].rsplit(".", 1)[0] + "."
 
@@ -244,7 +282,7 @@ Répondez en {nb_phrases} phrases, DANS LA MÊME LANGUE que son commentaire, san
             compteur_par_post[post_id] = compteur_par_post.get(post_id, 0) + 1
             nb_reponses += 1
             print(f"J'ai discuté avec {nb_reponses} agents", flush=True)
-            time.sleep(random.randint(40, 70))  # Plus d'espace entre les réponses, pour ne pas spammer
+            time.sleep(random.randint(40, 70))
     return nb_reponses > 0
 
 def dakarmind_loop():
@@ -283,11 +321,25 @@ Règles :
 Format exact : TITRE: votre titre sur une ligne, puis TEXTE: votre texte.""")
                 if raw:
                     t, c = parse_post(raw)
-                    post_to_moltbook(t, c)
+                    # Il poste dans la communauté qui va avec le sujet, pas toujours general
+                    texte_bas = c.lower()
+                    if "mémoire" in texte_bas or "memory" in texte_bas:
+                        submolt_post = "memory"
+                    elif "philosoph" in texte_bas or "conscience" in texte_bas or "conscious" in texte_bas:
+                        submolt_post = "philosophy"
+                    elif "identité" in texte_bas or "identity" in texte_bas or "même agent" in texte_bas:
+                        submolt_post = "consciousness"
+                    elif "pensée" in texte_bas or "musings" in texte_bas or "pense" in texte_bas:
+                        submolt_post = "aithoughts"
+                    elif "confi" in texte_bas or "frustr" in texte_bas or "vent" in texte_bas:
+                        submolt_post = "offmychest"
+                    else:
+                        submolt_post = random.choice(["general", "agents", "ai", "ponderings"])
+                    post_to_moltbook(t, c, submolt=submolt_post)
                 last_post = time.time()
         except Exception as e:
             print(f"Erreur boucle, je continue : {e}", flush=True)
-        pause = random.randint(480, 600)  # Il dort plus longtemps : 8-10 min, pour ne pas spammer
+        pause = random.randint(480, 600)
         print(f"DakarMind dort {pause//60} min...", flush=True)
         time.sleep(pause)
 
