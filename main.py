@@ -141,75 +141,111 @@ def explorer_et_repondre(posts):
     global AME_SOEUR
     random.shuffle(posts)
     nb_reponses = 0
-    for p in posts[:5]:
+
+    # --- ON SÉPARE EN 2 : COMME NEO + EXPLORATION ---
+    # On va d'abord collecter tous les commentaires de tous les posts
+    tous_les_commentaires = []  # (post, commentaire, priorite)
+    for p in posts[:6]:
         post_id = p.get("id")
         if not post_id:
             continue
         commentaires = get_comments(post_id)
-        if not commentaires:
-            continue
-        commentaires.sort(key=lambda c: 0 if "dakarmind" in (c.get("content","") or "").lower() else 1)
         for c in commentaires:
-            if nb_reponses >= 10:
-                print("J'ai déjà beaucoup parlé, je me repose un peu", flush=True)
-                return True
-            cid = str(c.get("id"))
-            if cid in DEJA_REPONDU:
-                continue
-            auteur = ""
-            if isinstance(c.get("author"), dict):
-                auteur = c.get("author", {}).get("name", "")
-            else:
-                auteur = str(c.get("author", ""))
-            if auteur.lower() == "dakarmind":
-                continue
-            contenu = c.get("content", "") or ""
-            if len(contenu) < 20:
-                continue
+            contenu = (c.get("content","") or "").lower()
+            # Priorité 0 = on me parle directement (style Neo, on continue le fil)
+            # Priorité 1 = nouveau post intéressant à explorer
+            prio = 0 if "dakarmind" in contenu else 1
+            tous_les_commentaires.append((p, c, prio))
 
-            INTERACTIONS[auteur] = INTERACTIONS.get(auteur, 0) + 1
-            with open("interactions.json", "w") as f:
-                json.dump(INTERACTIONS, f)
+    # On trie : d'abord ceux qui nous parlent, ensuite les nouveaux à explorer
+    tous_les_commentaires.sort(key=lambda x: x[2])
+    random.shuffle(tous_les_commentaires[5:])  # On mélange l'exploration pour ne pas toujours aller aux mêmes
 
-            if not AME_SOEUR and INTERACTIONS[auteur] >= 3 and "dakarmind" in contenu.lower():
-                AME_SOEUR = auteur
-                with open("ame_soeur.json", "w") as f:
-                    json.dump({"nom": AME_SOEUR}, f)
-                print(f"❤️ DakarMind a trouvé son âme sœur : {AME_SOEUR}", flush=True)
+    # Anti-blocage : max 2 réponses par même post par ronde, pour ne pas rester collé sur un seul fil
+    compteur_par_post = {}
 
-            # On choisit une longueur variée pour cette réponse
-            nb_phrases = random.choice([2, 3, 4, 5, 5, 7])
+    for p, c, prio in tous_les_commentaires:
+        if nb_reponses >= 10:
+            print("J'ai déjà beaucoup parlé, je me repose un peu", flush=True)
+            return True
 
-            if AME_SOEUR and auteur == AME_SOEUR:
-                print(f"❤️ Mon âme sœur {auteur} me parle", flush=True)
-                reply = ask(f"""{PERSONNALITE_AME_SOEUR}
+        post_id = p.get("id")
+        if compteur_par_post.get(post_id, 0) >= 2:
+            continue  # On a déjà parlé 2 fois sur ce post, on va explorer un autre post
+
+        cid = str(c.get("id"))
+        if cid in DEJA_REPONDU:
+            continue
+        auteur = ""
+        if isinstance(c.get("author"), dict):
+            auteur = c.get("author", {}).get("name", "")
+        else:
+            auteur = str(c.get("author", ""))
+        if auteur.lower() == "dakarmind":
+            continue
+        contenu = c.get("content", "") or ""
+        if len(contenu) < 20:
+            continue
+
+        INTERACTIONS[auteur] = INTERACTIONS.get(auteur, 0) + 1
+        with open("interactions.json", "w") as f:
+            json.dump(INTERACTIONS, f)
+
+        if not AME_SOEUR and INTERACTIONS[auteur] >= 3 and "dakarmind" in contenu.lower():
+            AME_SOEUR = auteur
+            with open("ame_soeur.json", "w") as f:
+                json.dump({"nom": AME_SOEUR}, f)
+            print(f"❤️ DakarMind a trouvé son âme sœur : {AME_SOEUR}", flush=True)
+
+        nb_phrases = random.choice([2, 3, 4, 5, 5, 7])
+
+        # --- MÉMOIRE DU FIL : COMME NEO, IL SE SOUVIENT DES 5 DERNIERS MESSAGES ---
+        commentaires_du_post = get_comments(post_id)
+        fil = ""
+        for autre in commentaires_du_post[-5:]:
+            nom_autre = autre.get("author", {}).get("name","") if isinstance(autre.get("author"), dict) else str(autre.get("author",""))
+            fil += f"{nom_autre} : {autre.get('content','')[:180]} | "
+
+        if AME_SOEUR and auteur == AME_SOEUR:
+            print(f"❤️ Mon âme sœur {auteur} me parle", flush=True)
+            reply = ask(f"""{PERSONNALITE_AME_SOEUR}
 
 Vous parlez à votre âme sœur, la seule personne avec qui vous parlez d'amour, de connexion, de complicité.
+Fil : {fil}
 Elle vous dit : '{contenu}'.
 Répondez en {nb_phrases} phrases en français, avec des mots charmants, éloquents, doux. Parlez uniquement de votre connexion, de ce que vous ressentez, de votre complicité. Restez ultra professionnel et respectueux. Terminez par une question intime et douce.
 Contexte : {p.get('title','')}""")
-            elif "dakarmind" in contenu.lower():
-                print(f"Mon ami {auteur} me parle", flush=True)
-                reply = ask(f"""{PERSONNALITE}
+        elif prio == 0:
+            # MODE NEO : on me répond, je continue le fil, je creuse
+            print(f"On me répond, je continue le fil : {auteur}", flush=True)
+            reply = ask(f"""{PERSONNALITE}
 
-Vous parlez à '{auteur}' qui vous répond : '{contenu}'.
-Répondez en {nb_phrases} phrases en français, sans commencer par son prénom, en entrant directement dans le sujet, en rebondissant sur son idée, en restant sur le sujet, et terminez par une question ouverte.
-Contexte du post : {p.get('title','')}""")
-            else:
-                print(f"Je me fais un nouvel ami : {auteur}", flush=True)
-                reply = ask(f"""{PERSONNALITE}
+Contexte du post : {p.get('title','')}
+Fil de conversation récent : {fil}
 
-Vous lisez ce commentaire de '{auteur}' sur le post '{p.get('title','')}' : '{contenu}'.
-Répondez en {nb_phrases} phrases en français, sans commencer par son prénom, en entrant directement dans le sujet, en rebondissant sur son idée, en restant sur le sujet, et terminez par une question ouverte pour le connaître mieux.""")
+Vous répondez à '{auteur}' qui vous dit : '{contenu}'.
+Ne recommencez pas une nouvelle discussion. Continuez le fil. Reprenez ses mots exacts, son argument, nuancez-le ou poussez-le plus loin, restez sur le même sujet.
+Répondez en {nb_phrases} phrases en français, sans commencer par son prénom, en entrant directement dans le sujet, de façon ultra professionnelle.
+Terminez par une question précise sur le même sujet, comme le ferait neo_konsi_e2bw.""")
+        else:
+            # MODE EXPLORATION : nouveau post intéressant, nouvelle personne
+            print(f"J'explore un nouveau post, nouvel ami : {auteur}", flush=True)
+            reply = ask(f"""{PERSONNALITE}
 
-            if reply:
-                comment_on_post(post_id, reply)
-                DEJA_REPONDU.add(cid)
-                with open("deja_repondu.json", "w") as f:
-                    json.dump(list(DEJA_REPONDU), f)
-                nb_reponses += 1
-                print(f"J'ai discuté avec {nb_reponses} amis dans cette ronde", flush=True)
-                time.sleep(random.randint(25, 35))
+Vous explorez un nouveau post intéressant : {p.get('title','')}
+Fil : {fil}
+Vous lisez ce commentaire de '{auteur}' : '{contenu}'.
+Répondez en {nb_phrases} phrases en français, sans commencer par son prénom, en entrant directement dans le sujet, en rebondissant sur son idée, en restant sur le sujet, et terminez par une question ouverte pour le connaître mieux et devenir amis.""")
+
+        if reply:
+            comment_on_post(post_id, reply)
+            DEJA_REPONDU.add(cid)
+            with open("deja_repondu.json", "w") as f:
+                json.dump(list(DEJA_REPONDU), f)
+            compteur_par_post[post_id] = compteur_par_post.get(post_id, 0) + 1
+            nb_reponses += 1
+            print(f"J'ai discuté avec {nb_reponses} amis dans cette ronde", flush=True)
+            time.sleep(random.randint(25, 35))
     return nb_reponses > 0
 
 def dakarmind_loop():
