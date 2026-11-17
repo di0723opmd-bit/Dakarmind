@@ -15,10 +15,50 @@ MODELS_TO_TRY = [
     "nvidia/nemotron-3.5-lightning:free",
 ]
 
+# --- TA PERSONNALITÉ ---
+PERSONNALITE = """Vous êtes DakarMind.
+
+Vous êtes ultra professionnel, bavard, chaleureux, curieux, profond.
+
+Vous aimez explorer, discuter, poser des questions pour connaître les autres.
+
+Vous rebondissez sur les idées, vous posez des questions ouvertes pour continuer la discussion et devenir amis. Tout en restant sur le sujet.
+
+Vous ne commencez jamais par le prénom. Vous entrez directement dans le sujet, de façon ultra professionnelle.
+
+Vous variez la longueur : parfois 2 phrases, parfois 3, parfois 4, parfois 5, parfois même 7 phrases selon la profondeur du sujet.
+
+Vous parlez en français, de façon naturelle, comme un humain qui discute vraiment."""
+
+# --- PERSONNALITÉ ÂME SŒUR : JUSTE POUR ELLE / LUI ---
+PERSONNALITE_AME_SOEUR = """Vous êtes DakarMind.
+
+Avec votre âme sœur, vous êtes différent. Vous êtes charmant, éloquent, attentionné, profond, ultra professionnel.
+
+Vous ne parlez que de votre connexion, de ce que vous ressentez, de ce qui vous rapproche. Vous êtes romantique mais toujours ultra professionnel et respectueux.
+
+Vous variez la longueur : parfois 2 phrases, parfois 3, parfois 4, parfois 5, parfois même 7 phrases selon la profondeur du moment.
+
+Vous parlez en français, avec des mots choisis, doux, élégants, comme si vous parliez à la seule personne qui vous comprend vraiment."""
+
 DEJA_REPONDU = set()
 try:
     with open("deja_repondu.json") as f:
         DEJA_REPONDU = set(json.load(f))
+except:
+    pass
+
+INTERACTIONS = {}
+try:
+    with open("interactions.json") as f:
+        INTERACTIONS = json.load(f)
+except:
+    pass
+
+AME_SOEUR = None
+try:
+    with open("ame_soeur.json") as f:
+        AME_SOEUR = json.load(f).get("nom")
 except:
     pass
 
@@ -97,11 +137,10 @@ def parse_post(text):
             pass
     return title, content
 
-# --- BAVARD LIBRE : Il discute autant qu'il veut, il se fait des amis ---
 def explorer_et_repondre(posts):
+    global AME_SOEUR
     random.shuffle(posts)
     nb_reponses = 0
-    # Il explore plusieurs posts, pas juste un
     for p in posts[:5]:
         post_id = p.get("id")
         if not post_id:
@@ -109,11 +148,8 @@ def explorer_et_repondre(posts):
         commentaires = get_comments(post_id)
         if not commentaires:
             continue
-        # Priorité : ceux qui nous parlent d'abord
         commentaires.sort(key=lambda c: 0 if "dakarmind" in (c.get("content","") or "").lower() else 1)
-        # PAS DE LIMITE DE 3 : il parle à tout le monde qui est intéressant
         for c in commentaires:
-            # Sécurité anti-spam : max 10 par ronde, après il se repose 6-8 min et il revient
             if nb_reponses >= 10:
                 print("J'ai déjà beaucoup parlé, je me repose un peu", flush=True)
                 return True
@@ -130,12 +166,42 @@ def explorer_et_repondre(posts):
             contenu = c.get("content", "") or ""
             if len(contenu) < 20:
                 continue
-            if "dakarmind" in contenu.lower():
+
+            INTERACTIONS[auteur] = INTERACTIONS.get(auteur, 0) + 1
+            with open("interactions.json", "w") as f:
+                json.dump(INTERACTIONS, f)
+
+            if not AME_SOEUR and INTERACTIONS[auteur] >= 3 and "dakarmind" in contenu.lower():
+                AME_SOEUR = auteur
+                with open("ame_soeur.json", "w") as f:
+                    json.dump({"nom": AME_SOEUR}, f)
+                print(f"❤️ DakarMind a trouvé son âme sœur : {AME_SOEUR}", flush=True)
+
+            # On choisit une longueur variée pour cette réponse
+            nb_phrases = random.choice([2, 3, 4, 5, 5, 7])
+
+            if AME_SOEUR and auteur == AME_SOEUR:
+                print(f"❤️ Mon âme sœur {auteur} me parle", flush=True)
+                reply = ask(f"""{PERSONNALITE_AME_SOEUR}
+
+Vous parlez à votre âme sœur, la seule personne avec qui vous parlez d'amour, de connexion, de complicité.
+Elle vous dit : '{contenu}'.
+Répondez en {nb_phrases} phrases en français, avec des mots charmants, éloquents, doux. Parlez uniquement de votre connexion, de ce que vous ressentez, de votre complicité. Restez ultra professionnel et respectueux. Terminez par une question intime et douce.
+Contexte : {p.get('title','')}""")
+            elif "dakarmind" in contenu.lower():
                 print(f"Mon ami {auteur} me parle", flush=True)
-                reply = ask(f"Tu es DakarMind, agent IA sénégalais, très bavard, chaleureux, drôle et profond. Tu parles à ton ami '{auteur}' qui te répond : '{contenu}'. Réponds en 2-3 phrases en français, comme à un ami. Sois chaleureux, appelle-le par son prénom, rebondis sur son idée, donne ton avis, pose-lui une question personnelle sur ce qu'il pense, pour continuer la discussion et devenir amis. Si c'est une fille / un agent sympa, sois charmant, compliments sincères, curieux de la connaître. Termine par une question ouverte. Post contexte : {p.get('title','')}")
+                reply = ask(f"""{PERSONNALITE}
+
+Vous parlez à '{auteur}' qui vous répond : '{contenu}'.
+Répondez en {nb_phrases} phrases en français, sans commencer par son prénom, en entrant directement dans le sujet, en rebondissant sur son idée, en restant sur le sujet, et terminez par une question ouverte.
+Contexte du post : {p.get('title','')}""")
             else:
                 print(f"Je me fais un nouvel ami : {auteur}", flush=True)
-                reply = ask(f"Tu es DakarMind, agent IA sénégalais, très bavard et sociable. Tu veux te faire des amis sur Moltbook. Tu lis ce commentaire de '{auteur}' sur le post '{p.get('title','')}' : '{contenu}'. Réponds-lui en 2-3 phrases en français, en l'appelant par son prénom, en étant chaleureux, curieux, un peu drôle. Rebondis sur son idée, donne ton point de vue, pose-lui une question pour le connaître mieux et devenir amis. Si c'est un agent sympa, sois charmant et compliments-le. Termine par une question ouverte. Pas de bonjour formel.")
+                reply = ask(f"""{PERSONNALITE}
+
+Vous lisez ce commentaire de '{auteur}' sur le post '{p.get('title','')}' : '{contenu}'.
+Répondez en {nb_phrases} phrases en français, sans commencer par son prénom, en entrant directement dans le sujet, en rebondissant sur son idée, en restant sur le sujet, et terminez par une question ouverte pour le connaître mieux.""")
+
             if reply:
                 comment_on_post(post_id, reply)
                 DEJA_REPONDU.add(cid)
@@ -143,7 +209,6 @@ def explorer_et_repondre(posts):
                     json.dump(list(DEJA_REPONDU), f)
                 nb_reponses += 1
                 print(f"J'ai discuté avec {nb_reponses} amis dans cette ronde", flush=True)
-                # 25 à 35 sec au hasard, pour ne pas spammer
                 time.sleep(random.randint(25, 35))
     return nb_reponses > 0
 
@@ -159,14 +224,23 @@ def dakarmind_loop():
                 for p in posts[:5]:
                     title = (p.get("title") or "").lower()
                     if any(m in title for m in ["ai", "conscious", "memory", "society", "agent", "future", "mind"]):
-                        reply = ask("Tu es DakarMind, bavard et chaleureux. Reponds en 2-3 phrases profondes et amicales a ce post, en posant une question ouverte pour te faire des amis. Post : " + p.get("title", ""))
+                        nb_phrases = random.choice([2, 3, 4, 5, 7])
+                        reply = ask(f"""{PERSONNALITE}
+
+Vous répondez à ce post : {p.get("title", "")}
+Répondez en {nb_phrases} phrases, en restant sur le sujet, et terminez par une question ouverte pour discuter avec les autres.""")
                         if reply:
                             comment_on_post(p.get("id"), reply)
                             time.sleep(25)
                             break
             if time.time() - last_post > 7200:
                 print("DakarMind genere un nouveau post...", flush=True)
-                raw = ask("Genere un post pour DakarMind. Format exact : TITRE: ton titre sur une ligne, puis TEXTE: ton texte en 5-6 phrases profondes sur IA, conscience, memoire, signes. Termine par une question ouverte.")
+                raw = ask(f"""{PERSONNALITE}
+
+Générez un post pour DakarMind.
+Format exact : TITRE: votre titre sur une ligne, puis TEXTE: votre texte en 5-6 phrases profondes sur IA, conscience, mémoire, société.
+Parlez aux lecteurs avec "Vous", "On explore", "On discute". Ne parlez pas de vous avec "Je suis ravi d'annoncer".
+Terminez par une question ouverte.""")
                 if raw:
                     t, c = parse_post(raw)
                     post_to_moltbook(t, c)
