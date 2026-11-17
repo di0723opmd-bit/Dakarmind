@@ -1,4 +1,4 @@
-"""DakarMind v2.2 : agent Moltbook sur la mémoire des agents.
+"""DakarMind v2.3 : agent Moltbook sur la mémoire des agents.
 
 Changements majeurs par rapport à la version Copilot :
 - résolution des défis de vérification Moltbook (sans ça, le contenu reste non publié)
@@ -8,6 +8,7 @@ Changements majeurs par rapport à la version Copilot :
 - plus de double commentaire sur un même post
 - consigne système séparée, texte externe balisé contre les injections
 - filtre qualité aligné sur la persona, sans troncature qui coupe la question finale
+- v2.3 : dédoublonnage d'après l'API (survit aux redémarrages), commentaires supprimés/spam ignorés
 - v2.2 : conversations en fil (réponses aux réponses), plafond de commentaires par post, SKIP, filtre anti-flatterie
 - v2.1 : disjoncteur OpenRouter (un seul essai par modèle, suspension sur 429, budget quotidien d'appels)
 """
@@ -400,6 +401,7 @@ SHAPE_LOGGED = False
 def get_comments(post_id):
     global SHAPE_LOGGED
     items = flatten_comments(entries_of(api_get(f"/posts/{post_id}/comments")))
+    items = [c for c in items if c.get("is_deleted") is not True and c.get("is_spam") is not True]
     if items and not SHAPE_LOGGED:
         SHAPE_LOGGED = True
         nested = sum(1 for c in items if parent_of(c))
@@ -722,11 +724,18 @@ def my_comments_in(comments):
     return [c for c in comments if is_me(author_name(c))]
 
 
+def answered_ids(comments):
+    """Commentaires auxquels j'ai déjà répondu, d'après l'API : fiable même si le disque a été effacé."""
+    return {parent_of(c) for c in my_comments_in(comments) if parent_of(c)}
+
+
 def replies_to_me(comments):
     mine = {str(c.get("id")) for c in my_comments_in(comments) if c.get("id")}
+    done = answered_ids(comments)
     return [
         c for c in comments
-        if parent_of(c) and parent_of(c) in mine and not is_me(author_name(c))
+        if parent_of(c) and parent_of(c) in mine
+        and not is_me(author_name(c)) and str(c.get("id")) not in done
     ]
 
 
@@ -790,6 +799,7 @@ def reply_to_my_posts():
 
         comments = get_comments(post_id)
         mine = {str(c.get("id")) for c in my_comments_in(comments) if c.get("id")}
+        done = answered_ids(comments)
 
         for comment in comments:
             comment_id = str(comment.get("id", ""))
@@ -799,6 +809,7 @@ def reply_to_my_posts():
             if (
                 not comment_id
                 or comment_id in DEJA_REPONDU
+                or comment_id in done
                 or is_me(author_name(comment))
                 or len(content) < 20
                 or (parent and parent not in mine)  # dialogue entre deux autres agents
@@ -898,6 +909,9 @@ def maybe_reply_to_post(posts):
             continue
         if not can_comment():
             return False
+        if my_comments_in(get_comments(post_id)):
+            mark_commented(post_id)
+            continue
 
         body = (post.get("content") or "").strip()
         prompt = f"Post :\n{fence(title, 300)}\n"
