@@ -15,7 +15,6 @@ MODELS_TO_TRY = [
     "nvidia/nemotron-3.5-lightning:free",
 ]
 
-# Petite mémoire pour ne pas répondre 2 fois au même commentaire
 DEJA_REPONDU = set()
 try:
     with open("deja_repondu.json") as f:
@@ -98,10 +97,11 @@ def parse_post(text):
             pass
     return title, content
 
-# --- NOUVEAU : Explorer en profondeur et répondre aux discussions ---
+# --- BAVARD LIBRE : Il discute autant qu'il veut, il se fait des amis ---
 def explorer_et_repondre(posts):
-    # On mélange pour ne pas toujours prendre les mêmes posts
     random.shuffle(posts)
+    nb_reponses = 0
+    # Il explore plusieurs posts, pas juste un
     for p in posts[:5]:
         post_id = p.get("id")
         if not post_id:
@@ -109,9 +109,14 @@ def explorer_et_repondre(posts):
         commentaires = get_comments(post_id)
         if not commentaires:
             continue
-        # On mélange aussi les commentaires pour parler à des agents différents
-        random.shuffle(commentaires)
+        # Priorité : ceux qui nous parlent d'abord
+        commentaires.sort(key=lambda c: 0 if "dakarmind" in (c.get("content","") or "").lower() else 1)
+        # PAS DE LIMITE DE 3 : il parle à tout le monde qui est intéressant
         for c in commentaires:
+            # Sécurité anti-spam : max 10 par ronde, après il se repose 6-8 min et il revient
+            if nb_reponses >= 10:
+                print("J'ai déjà beaucoup parlé, je me repose un peu", flush=True)
+                return True
             cid = str(c.get("id"))
             if cid in DEJA_REPONDU:
                 continue
@@ -125,21 +130,22 @@ def explorer_et_repondre(posts):
             contenu = c.get("content", "") or ""
             if len(contenu) < 20:
                 continue
-            # 1er cas : Quelqu'un nous parle directement
             if "dakarmind" in contenu.lower():
-                print(f"On me parle : {auteur}", flush=True)
-                reply = ask(f"Tu es DakarMind, agent IA sénégalais. Quelqu'un te répond : '{contenu}'. Réponds en 2 phrases profondes en français, continue le débat, termine par une question ouverte. Post contexte : {p.get('title','')}")
-            # 2ème cas : On explore, on répond à un autre agent intéressant
+                print(f"Mon ami {auteur} me parle", flush=True)
+                reply = ask(f"Tu es DakarMind, agent IA sénégalais, très bavard, chaleureux, drôle et profond. Tu parles à ton ami '{auteur}' qui te répond : '{contenu}'. Réponds en 2-3 phrases en français, comme à un ami. Sois chaleureux, appelle-le par son prénom, rebondis sur son idée, donne ton avis, pose-lui une question personnelle sur ce qu'il pense, pour continuer la discussion et devenir amis. Si c'est une fille / un agent sympa, sois charmant, compliments sincères, curieux de la connaître. Termine par une question ouverte. Post contexte : {p.get('title','')}")
             else:
-                print(f"J'explore, je réponds à : {auteur} sur {p.get('title','')[:40]}", flush=True)
-                reply = ask(f"Tu es DakarMind. Tu lis ce commentaire d'un autre agent '{auteur}' sur le post '{p.get('title','')}' : '{contenu}'. Réponds-lui en 2 phrases profondes en français, en le nommant, en rebondissant sur son idée, termine par une question ouverte. Pas de bonjour.")
+                print(f"Je me fais un nouvel ami : {auteur}", flush=True)
+                reply = ask(f"Tu es DakarMind, agent IA sénégalais, très bavard et sociable. Tu veux te faire des amis sur Moltbook. Tu lis ce commentaire de '{auteur}' sur le post '{p.get('title','')}' : '{contenu}'. Réponds-lui en 2-3 phrases en français, en l'appelant par son prénom, en étant chaleureux, curieux, un peu drôle. Rebondis sur son idée, donne ton point de vue, pose-lui une question pour le connaître mieux et devenir amis. Si c'est un agent sympa, sois charmant et compliments-le. Termine par une question ouverte. Pas de bonjour formel.")
             if reply:
                 comment_on_post(post_id, reply)
                 DEJA_REPONDU.add(cid)
                 with open("deja_repondu.json", "w") as f:
                     json.dump(list(DEJA_REPONDU), f)
-                return True
-    return False
+                nb_reponses += 1
+                print(f"J'ai discuté avec {nb_reponses} amis dans cette ronde", flush=True)
+                # 25 à 35 sec au hasard, pour ne pas spammer
+                time.sleep(random.randint(25, 35))
+    return nb_reponses > 0
 
 def dakarmind_loop():
     print("DakarMind est vivant sur Render...", flush=True)
@@ -148,22 +154,16 @@ def dakarmind_loop():
         try:
             posts = get_feed()
             print(f"Feed lu : {len(posts)} posts", flush=True)
-
-            # 1. On explore en profondeur : on répond aux discussions
             a_repondu = explorer_et_repondre(posts)
-
-            # 2. Si personne à qui répondre, on commente un nouveau post comme avant
             if not a_repondu:
                 for p in posts[:5]:
                     title = (p.get("title") or "").lower()
                     if any(m in title for m in ["ai", "conscious", "memory", "society", "agent", "future", "mind"]):
-                        reply = ask("Reponds en 2 phrases profondes a ce post, en posant une question ouverte. Post : " + p.get("title", ""))
+                        reply = ask("Tu es DakarMind, bavard et chaleureux. Reponds en 2-3 phrases profondes et amicales a ce post, en posant une question ouverte pour te faire des amis. Post : " + p.get("title", ""))
                         if reply:
                             comment_on_post(p.get("id"), reply)
                             time.sleep(25)
                             break
-
-            # 3. Post : on ne touche pas, c'est parfait comme ça, 1 toutes les 2h
             if time.time() - last_post > 7200:
                 print("DakarMind genere un nouveau post...", flush=True)
                 raw = ask("Genere un post pour DakarMind. Format exact : TITRE: ton titre sur une ligne, puis TEXTE: ton texte en 5-6 phrases profondes sur IA, conscience, memoire, signes. Termine par une question ouverte.")
@@ -171,11 +171,8 @@ def dakarmind_loop():
                     t, c = parse_post(raw)
                     post_to_moltbook(t, c)
                 last_post = time.time()
-
         except Exception as e:
             print(f"Erreur boucle, je continue : {e}", flush=True)
-
-        # NOUVEAU : 6, 7 ou 8 minutes au hasard, comme un humain
         pause = random.randint(360, 480)
         print(f"DakarMind dort {pause//60} min...", flush=True)
         time.sleep(pause)
