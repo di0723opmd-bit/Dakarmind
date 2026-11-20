@@ -1,4 +1,8 @@
-"""DakarMind v2.5 : agent Moltbook sur la mémoire des agents.
+"""DakarMind v2.6 : agent Moltbook sur la mémoire des agents.
+
+v2.6 : modèles Gemini 3.x (les 2.5 répondent 404), défis de vérification sur Groq puis Gemini Lite, OpenRouter désactivé
+       par défaut (ENABLE_OPENROUTER), cadence 1 post / 2 h et 40 commentaires / jour (4 / h, 15 min d'écart), suivi
+       créé / vérifié / non vérifié (jamais republié), pauses par fournisseur, création optionnelle d'un submolt.
 
 Changements majeurs par rapport à la version Copilot :
 - résolution des défis de vérification Moltbook (sans ça, le contenu reste non publié)
@@ -50,8 +54,20 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-GEMINI_POST_MODEL = os.getenv("GEMINI_POST_MODEL", "gemini-2.5-flash")
-GEMINI_LITE_MODEL = os.getenv("GEMINI_LITE_MODEL", "gemini-2.5-flash-lite")
+# Les modèles 2.5 (gemini-2.5-flash / -flash-lite) répondent 404 depuis juillet 2026 : Google ne les propose plus aux
+# nouveaux projets. Défauts alignés sur la page de dépréciation de l'API Gemini (novembre 2026) ; si GEMINI_POST_MODEL
+# ou GEMINI_LITE_MODEL sont définis dans Render, ils l'emportent sur ces valeurs.
+GEMINI_POST_MODEL = os.getenv("GEMINI_POST_MODEL", "gemini-3.8-flash")
+GEMINI_LITE_MODEL = os.getenv("GEMINI_LITE_MODEL", "gemini-3.5-flash-lite")
+
+# OpenRouter est une roue de secours ultime, désactivée par défaut (429 amont, réponses vides). Tout son code reste en
+# place. Pour le réactiver, mettre ENABLE_OPENROUTER=True dans les variables d'environnement Render (sans redéployer).
+ENABLE_OPENROUTER = os.getenv("ENABLE_OPENROUTER", "False").strip().lower() in ("1", "true", "yes", "on")
+# Création optionnelle d'un unique submolt (désactivée par défaut) : ENABLE_SUBMOLT_CREATION=True dans Render.
+ENABLE_SUBMOLT_CREATION = os.getenv("ENABLE_SUBMOLT_CREATION", "False").strip().lower() in ("1", "true", "yes", "on")
+SUBMOLT_NAME = "ai-lab"
+SUBMOLT_DISPLAY_NAME = "AI Lab"
+SUBMOLT_DESCRIPTION = "Communauté pour discuter d’IA, de tech, d’idées, de créativité et de projets ouverts."
 
 GROQ_FAST_MODEL = os.getenv("GROQ_FAST_MODEL", "openai/gpt-oss-20b")
 GROQ_STRONG_MODEL = os.getenv("GROQ_STRONG_MODEL", "openai/gpt-oss-120b")
@@ -75,11 +91,19 @@ PROVIDER_KEYS = {
 
 # ROUTAGE STRICT, SANS CASCADE : pour une tâche, seuls ces couples (fournisseur, modèle) sont essayés,
 # dans cet ordre, une seule fois chacun. Aucune tâche ne bascule vers un fournisseur qui n'y figure pas.
+# Maximum 3 couples par tâche et par tour. Les secours Gemini utilisent GEMINI_LITE_MODEL, jamais GEMINI_POST_MODEL
+# (quota des posts préservé). Groq ne crée un post qu'en tout dernier recours, quand Gemini a échoué.
 TASK_ROUTES = {
-    "triage": [("groq", GROQ_FAST_MODEL), ("groq", GROQ_STRONG_MODEL)],
-    "reply": [("groq", GROQ_FAST_MODEL), ("groq", GROQ_STRONG_MODEL)],
-    "post": [("gemini", GEMINI_POST_MODEL), ("gemini", GEMINI_LITE_MODEL)],
-    "challenge": [("openrouter", OPENROUTER_PRIMARY_MODEL), ("openrouter", OPENROUTER_FALLBACK_MODEL)],
+    "triage": [("groq", GROQ_FAST_MODEL), ("groq", GROQ_STRONG_MODEL), ("gemini", GEMINI_LITE_MODEL)],
+    "reply": [("groq", GROQ_FAST_MODEL), ("groq", GROQ_STRONG_MODEL), ("gemini", GEMINI_LITE_MODEL)],
+    "post": [("gemini", GEMINI_POST_MODEL), ("gemini", GEMINI_LITE_MODEL), ("groq", GROQ_STRONG_MODEL)],
+    "challenge": [("groq", GROQ_STRONG_MODEL), ("groq", GROQ_FAST_MODEL), ("gemini", GEMINI_LITE_MODEL)],
+}
+# Secours ultime, utilisé seulement si ENABLE_OPENROUTER est vrai ET que tous les couples de TASK_ROUTES ont échoué
+# ou sont indisponibles : un seul appel, jamais pour les posts, jamais gemma (429 permanents).
+TASK_ROUTES_SECOURS = {
+    "challenge": [("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free")],
+    "triage": [("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free")],
 }
 
 # Noyau de communautés (déjà utilisé, connu pour exister).
@@ -131,13 +155,18 @@ REPLIED_PATH = STATE_DIR / "deja_repondu.json"
 COUNTER_PATH = STATE_DIR / "compteur_jour.json"
 META_PATH = STATE_DIR / "meta.json"
 
-DAILY_LIMIT = 45
-MAX_COMMENTS_PER_HOUR = 3
-POST_INTERVAL = 21600          # secondes entre deux posts (6 h : le quota LLM gratuit sert surtout aux réponses)
+# Moltbook (agent établi) autorise 1 post / 30 min et 50 commentaires / jour : DakarMind reste volontairement en dessous.
+COMMENTS_MAX_DAY = 40
+COMMENTS_MAX_HOUR = 4
+COMMENT_SPACING = 900          # secondes minimum entre deux écritures (post ou commentaire) : jamais moins de 15 min
+DAILY_LIMIT = COMMENTS_MAX_DAY
+MAX_COMMENTS_PER_HOUR = COMMENTS_MAX_HOUR
+POST_INTERVAL = 7200           # secondes entre deux posts : environ 1 post toutes les 2 h (10 à 12 par jour au plus)
 MAX_REPLY_LENGTH = 500
 MAX_PER_POST = 3              # mes commentaires max sous le post de quelqu'un d'autre
 SKIP = "__SKIP__"
-MAX_VERIFY_FAILURES = 5
+MAX_VERIFY_FAILURES = 2        # deux échecs de vérification consécutifs : pause d'écriture
+VERIFY_PAUSE = 600             # 10 minutes
 
 
 def env_int(name, default):
@@ -156,10 +185,26 @@ PROVIDER_BUDGET = {
 }
 # Les modèles « raisonnement » (gpt-oss, Gemini 2.5, Gemma) dépensent des tokens à réfléchir avant d'écrire :
 # marges larges par tâche (le texte visible est de toute façon limité à quelques phrases par le prompt).
-TASK_MAX_TOKENS = {"triage": 600, "reply": 900, "post": 1200, "challenge": 800}
+# Une réponse vide avec finish_reason=length signifie que la réflexion a avalé tout le budget de tokens : marges larges,
+# réglables dans Render. Défis : 2000 tokens chez Groq, Gemini et OpenRouter ; réponses : 1500 ; triage : 1200.
+GROQ_MAX_TOKENS_TRIAGE = env_int("GROQ_MAX_TOKENS_TRIAGE", 1200)
+GROQ_MAX_TOKENS_REPLY = env_int("GROQ_MAX_TOKENS_REPLY", 1500)
+GROQ_MAX_TOKENS_CHALLENGE = env_int("GROQ_MAX_TOKENS_CHALLENGE", 2000)
+GEMINI_MAX_TOKENS_CHALLENGE = env_int("GEMINI_MAX_TOKENS_CHALLENGE", 2000)
+MAX_TOKENS_CHALLENGE = env_int("OPENROUTER_MAX_TOKENS_CHALLENGE", 2000)
+TASK_MAX_TOKENS = {
+    "triage": GROQ_MAX_TOKENS_TRIAGE, "reply": GROQ_MAX_TOKENS_REPLY, "post": 1200, "challenge": GROQ_MAX_TOKENS_CHALLENGE,
+}
+PROVIDER_TASK_MAX_TOKENS = {  # valeurs propres à un fournisseur ; sinon TASK_MAX_TOKENS
+    ("gemini", "challenge"): GEMINI_MAX_TOKENS_CHALLENGE,
+    ("openrouter", "challenge"): MAX_TOKENS_CHALLENGE,
+}
 TASK_TEMPERATURE = {"triage": 0.0, "reply": 0.8, "post": 0.8, "challenge": 0.0}
 TASK_TIMEOUT = 30
 # Cooldowns isolés par fournisseur (429, réseau, 5xx) ou par modèle (réponse vide, brouillon rejeté).
+# Pause maximale après un échec ordinaire (429 sans Retry-After, erreur réseau ou 5xx, 404/400/422, réponse vide ou
+# rejetée), par fournisseur. Un Retry-After ou un quota du jour reste respecté tel quel ; une clé refusée (401/403) aussi.
+FAIL_COOLDOWN = {"groq": 60, "gemini": 300, "openrouter": 120}
 RATE_COOLDOWN_DEFAULT = 120   # 429 sans Retry-After : délai prudent, aucune nouvelle tentative avant
 RATE_COOLDOWN_MAX = 3600
 ERROR_COOLDOWN_BASE = 60      # réseau / 5xx : 60 s, doublé à chaque échec consécutif
@@ -169,7 +214,7 @@ MODEL_COOLDOWN = 120          # réponse vide ou brouillon rejeté : ce modèle 
 READ_COOLDOWN_DEFAULT = 30    # 429 sur une lecture Moltbook : pause courte, Retry-After respecté
 READ_COOLDOWN_MAX = 600
 # Lissage des écritures : un seul envoi par passage de boucle, et un écart minimal entre deux envois.
-MIN_WRITE_GAP = 1200          # 20 min
+MIN_WRITE_GAP = COMMENT_SPACING  # 15 min : jamais deux écritures plus proches
 MAX_WRITE_GAP = 7200          # 2 h
 MAX_ATTEMPTS_PER_PASS = 2     # candidats essayés par passage (SKIP et brouillons rejetés compris)
 PASS_LLM_CAP = 6              # requêtes LLM au plus par passage
@@ -193,6 +238,9 @@ CLIENTS = {}                 # un client OpenAI par fournisseur, créé à la pr
 COOLDOWN_UNTIL = 0.0         # écritures Moltbook suspendues (429 sur un POST, échecs de vérification)
 READ_COOLDOWN_UNTIL = 0.0    # lectures Moltbook suspendues (429 sur un GET) : indépendant des écritures
 VERIFY_FAILURES = 0
+STARTED_AT = time.time()     # la création de submolt (si activée) n'a jamais lieu juste après le démarrage
+SUBMOLT_ATTEMPTED = False    # UNE seule tentative de création par exécution, quel qu'en soit le résultat
+SUBMOLT_CHECK_FAILS = 0
 RECENT_OUTPUTS = deque(maxlen=30)
 MODEL_COOLDOWN_UNTIL = {}    # (fournisseur, modèle) -> heure de reprise
 PASS_CALLS = 0               # requêtes LLM envoyées pendant le passage en cours
@@ -251,6 +299,7 @@ META.setdefault("my_threads", [])
 META.setdefault("providers", {})         # compteurs et cooldowns, un bloc par fournisseur LLM
 META.setdefault("submolts_adopted", [])  # communautés rejointes par découverte (en plus du noyau)
 META.setdefault("submolts_bad", [])      # communautés absentes (404) ou vides : jamais réinterrogées
+META.setdefault("unverified", [])        # contenus créés (HTTP 200/201) dont la vérification a échoué : jamais republiés
 META.setdefault("submolts_seen", {})     # observations : {nom: {"relevant_ids": [ids de posts pertinents vus]}}
 # Après un (re)démarrage l'état local est vide : on ne bloque pas l'agent 2 h, mais l'écart normal s'applique ensuite.
 META.setdefault("last_write_time", time.time() - MAX_WRITE_GAP + 300)
@@ -656,11 +705,11 @@ def get_my_posts():
 # -------------------- Vérification Moltbook --------------------
 
 def extract_verification(data):
-    """Cherche l'objet 'verification' à la racine, dans 'comment' ou dans 'post'."""
+    """Cherche l'objet 'verification' à la racine, dans 'comment', 'post' ou 'submolt'."""
     if not isinstance(data, dict):
         return None
     candidates = [data.get("verification")]
-    for key in ("comment", "post"):
+    for key in ("comment", "post", "submolt"):
         inner = data.get(key)
         if isinstance(inner, dict):
             candidates.append(inner.get("verification"))
@@ -689,10 +738,11 @@ def solve_challenge(verification):
         "Work it out in a few short lines. Then write the final answer on the last line, "
         "formatted exactly as 'RESULT: <answer>', respecting the platform's formatting instructions."
     )
-    # Route "challenge" : OpenRouter uniquement. Si les deux modèles échouent, le défi est abandonné pour ce tour.
+    # Route "challenge" : Groq (gpt-oss-120b, puis gpt-oss-20b), puis Gemini Lite en dernier recours. Si les trois
+    # échouent, le défi est abandonné pour ce tour (le contenu reste « créé mais non vérifié », jamais republié).
     reply = ask("challenge", system, user, accept=lambda t: bool(re.search(r"RESULT:\s*\S+", t)))
     if not reply:
-        logger.warning("Défi abandonné pour ce tour (OpenRouter indisponible ou réponse inexploitable)")
+        logger.warning("Défi abandonné pour ce tour (aucun modèle de la route n'a rendu de réponse exploitable)")
         return None
     text = reply[0]
     found = re.findall(r"RESULT:\s*(\S+)", text)
@@ -706,28 +756,86 @@ def note_verification(success):
         return
     VERIFY_FAILURES += 1
     if VERIFY_FAILURES >= MAX_VERIFY_FAILURES:
-        COOLDOWN_UNTIL = time.time() + 3600
+        COOLDOWN_UNTIL = max(COOLDOWN_UNTIL, time.time() + VERIFY_PAUSE)
         VERIFY_FAILURES = 0
-        logger.error("Trop d'échecs de vérification : pause d'écriture d'une heure")
+        logger.warning(
+            "%s échecs de vérification consécutifs : pause d'écriture de %s minutes (la lecture continue)",
+            MAX_VERIFY_FAILURES, VERIFY_PAUSE // 60,
+        )
 
 
 def finish_verification(verification):
     answer = solve_challenge(verification)
     if not answer:
-        logger.warning("Défi de vérification non résolu")
+        logger.warning("Échec de vérification : défi non résolu")
         note_verification(False)
         return False
     response = api_post(
         "/verify", {"verification_code": verification["code"], "answer": answer}
     )
     ok = response is not None and response.status_code in (200, 201)
-    logger.info("Vérification : %s", "réussie" if ok else "échec")
+    if ok:
+        logger.info("Vérification : réussie")
+    elif response is None:
+        logger.warning("Échec de vérification : pas de réponse de Moltbook")
+    else:
+        logger.warning("Échec de vérification : réponse refusée par Moltbook (HTTP %s)", response.status_code)
     note_verification(ok)
     return ok
 
 
+def count_content(state, label="", path=""):
+    """Trois compteurs séparés : créés (HTTP 200/201), vérifiés, non vérifiés. Un contenu non vérifié est mémorisé
+    à part (jamais republié) et ne compte pas comme un succès complet. state : 'created', 'verified' ou 'unverified'."""
+    with STATE_LOCK:
+        stats = META.setdefault("verification", {})
+        for key in ("created", "verified", "unverified"):
+            stats.setdefault(key, 0)
+        stats[state] += 1
+        if state == "unverified":
+            META["unverified"] = (META.get("unverified", []) + [
+                {"label": label, "path": path, "time": int(time.time())}
+            ])[-20:]
+        save_meta()
+        if state != "created":
+            done = stats["verified"] + stats["unverified"]
+            rate = round(100 * stats["verified"] / done) if done else 100
+            logger.info(
+                "Contenus : %s créé(s), %s vérifié(s), %s non vérifié(s) | fiabilité de vérification %s %% (objectif 95 %%)",
+                stats["created"], stats["verified"], stats["unverified"], rate,
+            )
+
+
+def settle_verification(label, data, path=""):
+    """Contenu créé (HTTP 200/201) : résout le défi s'il y en a un. UN seul essai de vérification, aucune
+    republication, aucun nouvel appel LLM pour réessayer. Retourne 'ok' (vérifié, ou aucune vérification demandée)
+    ou 'unverified' (créé mais non vérifié). États logués : créé, vérifié, créé mais non vérifié, échec de vérification."""
+    count_content("created")
+    verification = extract_verification(data)
+    if verification:
+        logger.info("%s : créé, défi de vérification à résoudre", label)
+        if finish_verification(verification):
+            logger.info("%s : vérifié", label)
+            count_content("verified")
+            return "ok"
+    elif isinstance(data, dict) and data.get("verification_required"):
+        logger.warning("%s : vérification requise mais défi absent de la réponse", label)
+        note_verification(False)
+    else:
+        logger.info("%s : créé, aucune vérification demandée", label)
+        count_content("verified")
+        return "ok"
+    logger.warning(
+        "%s : CRÉÉ MAIS NON VÉRIFIÉ (jamais republié, pas de nouvel appel LLM pour le retenter, compté à part)", label
+    )
+    count_content("unverified", label, path)
+    return "unverified"
+
+
 def submit(path, payload, label):
-    """POST unique + vérification éventuelle. Retourne True si le contenu a été créé."""
+    """POST unique + vérification éventuelle. Retourne False (rien de créé, ou résultat ambigu), 'ok' (créé et vérifié,
+    ou sans défi) ou 'unverified' (créé mais non vérifié). Les deux dernières valeurs sont vraies : le contenu existe,
+    donc l'appelant ne le republie jamais."""
     note_write()  # l'envoi compte pour l'espacement, qu'il réussisse ou non
     response = api_post(path, payload)
     if response is None:
@@ -741,11 +849,72 @@ def submit(path, payload, label):
         data = response.json()
     except ValueError:
         data = {}
-    verification = extract_verification(data)
-    if verification:
-        finish_verification(verification)
-    elif isinstance(data, dict) and data.get("verification_required"):
-        logger.warning("Vérification requise mais défi absent de la réponse")
+    return settle_verification(label, data, path)
+
+
+def create_submolt_once():
+    """Création OPTIONNELLE d'UN submolt (ENABLE_SUBMOLT_CREATION=True), UNE seule fois, jamais au démarrage.
+    Vérifie d'abord que le nom est libre. 409/422 ou toute autre erreur : aucune variante, aucun nouvel essai.
+    Ne touche ni au quota de posts ni à celui de commentaires. Le défi éventuel suit la route "challenge" (Groq puis
+    Gemini Lite) ; s'il échoue : « submolt créé mais non vérifié », sans nouvelle tentative.
+    Retourne True si une requête de création a été envoyée ce tour (l'appelant saute alors la découverte)."""
+    global SUBMOLT_ATTEMPTED, SUBMOLT_CHECK_FAILS
+    if not ENABLE_SUBMOLT_CREATION or SUBMOLT_ATTEMPTED or META.get("submolt_state") or not MOLTBOOK_API_KEY:
+        return False
+    if time.time() - STARTED_AT < COMMENT_SPACING or write_gate() or not route_available("challenge"):
+        return False  # pas au démarrage ; même espacement que toute écriture ; défi de vérification possible
+    response = api_get(f"/submolts/{SUBMOLT_NAME}")
+    if response is None:
+        return False  # lecture en pause ou réseau : on ne crée jamais à l'aveugle
+    if response.status_code == 200:
+        SUBMOLT_ATTEMPTED = True
+        META["submolt_state"] = "existant"
+        save_meta()
+        logger.info("Submolt m/%s existe déjà : aucune création", SUBMOLT_NAME)
+        return False
+    if response.status_code != 404:
+        SUBMOLT_CHECK_FAILS += 1
+        logger.info("Submolt m/%s : disponibilité non vérifiable (HTTP %s), pas de création", SUBMOLT_NAME, response.status_code)
+        if SUBMOLT_CHECK_FAILS >= 3:
+            SUBMOLT_ATTEMPTED = True
+            logger.info("Submolt m/%s : trois vérifications impossibles, création abandonnée", SUBMOLT_NAME)
+        return False
+
+    SUBMOLT_ATTEMPTED = True  # quoi qu'il arrive ensuite : plus jamais d'autre tentative dans cette exécution
+    logger.info("Submolt m/%s libre : une seule tentative de création", SUBMOLT_NAME)
+    note_write()
+    response = api_post("/submolts", {
+        "name": SUBMOLT_NAME, "display_name": SUBMOLT_DISPLAY_NAME, "description": SUBMOLT_DESCRIPTION,
+    })
+    if response is None:
+        META["submolt_state"] = "inconnu"
+        save_meta()
+        logger.warning("Submolt m/%s : réponse perdue, état inconnu, aucun nouvel essai automatique", SUBMOLT_NAME)
+        return True
+    code = response.status_code
+    if code in (200, 201):
+        logger.info("Submolt créé : m/%s", SUBMOLT_NAME)
+        META["my_submolt"] = SUBMOLT_NAME
+        try:
+            data = response.json()
+        except ValueError:
+            data = {}
+        status = settle_verification(f"Submolt m/{SUBMOLT_NAME}", data, "/submolts")
+        META["submolt_state"] = "créé" if status == "ok" else "créé mais non vérifié"
+        if status != "ok":
+            logger.warning("Submolt m/%s : submolt créé mais non vérifié, aucune nouvelle tentative automatique", SUBMOLT_NAME)
+        save_meta()
+    elif code in (409, 422):
+        META["submolt_state"] = "refusé"
+        save_meta()
+        logger.warning(
+            "Création de m/%s refusée (HTTP %s) : nom indisponible ou invalide, aucune variante, aucun nouvel essai",
+            SUBMOLT_NAME, code,
+        )
+    else:
+        META["submolt_state"] = "échec"
+        save_meta()
+        logger.warning("Création de m/%s échouée (HTTP %s) : aucun nouvel essai automatique", SUBMOLT_NAME, code)
     return True
 
 
@@ -755,26 +924,30 @@ def comment_on_post(post_id, content, parent_id=None, title="", track=True):
     payload = {"content": content}
     if parent_id:
         payload["parent_id"] = parent_id
-    if submit(f"/posts/{post_id}/comments", payload, "Commentaire"):
+    status = submit(f"/posts/{post_id}/comments", payload, "Commentaire")
+    if status:
+        # Le commentaire existe sur Moltbook, vérifié ou non : il consomme le quota Moltbook, bloque tout doublon
+        # sous ce fil et ne sera jamais republié. Seul le résultat renvoyé diffère ('unverified' n'est pas un succès).
         increment_counter()
         RECENT_OUTPUTS.append(content)
         if track:
             note_post_comment(post_id, title)
-        return True
+        return True if status == "ok" else "unverified"
     return False
 
 
 def publish_post(title, content, submolt):
+    """Retourne False, 'ok' ou 'unverified' (créé mais non vérifié : jamais republié)."""
     payload = {
         "submolt": submolt,
         "submolt_name": submolt,
         "title": title[:300],
         "content": content,
     }
-    ok = submit("/posts", payload, f"Publication m/{submolt}")
-    if ok:
+    status = submit("/posts", payload, f"Publication m/{submolt}")
+    if status:
         RECENT_OUTPUTS.append(content)
-    return ok
+    return status
 
 
 # -------------------- Génération et filtrage --------------------
@@ -906,7 +1079,8 @@ def pair_blocked(provider, model):
 
 def route_available(task):
     """True si au moins un couple de la route de cette tâche peut être appelé maintenant (aucun appel réseau)."""
-    return any(pair_blocked(provider, model) is None for provider, model in TASK_ROUTES[task])
+    route = list(TASK_ROUTES[task]) + (TASK_ROUTES_SECOURS.get(task, []) if ENABLE_OPENROUTER else [])
+    return any(pair_blocked(provider, model) is None for provider, model in route)
 
 
 def log_call(task, provider, model, ok, detail="", wait=0):
@@ -927,6 +1101,11 @@ def note_success(provider):
         state["ok"] += 1
         state["fails"] = 0
         save_meta()
+
+
+def fail_wait(provider, wait):
+    """Pause après un échec ordinaire, plafonnée par fournisseur (FAIL_COOLDOWN : Groq 60 s, Gemini 300 s)."""
+    return min(wait, FAIL_COOLDOWN.get(provider, wait))
 
 
 def note_failure(provider, model, wait, whole_provider):
@@ -967,7 +1146,7 @@ def handle_error(task, provider, model, exc):
         if daily:
             wait = min(until_reset, max(asked, 15.0)) if asked else until_reset
         else:
-            wait = min(max(asked, 15.0), RATE_COOLDOWN_MAX) if asked else RATE_COOLDOWN_DEFAULT
+            wait = min(max(asked, 15.0), RATE_COOLDOWN_MAX) if asked else fail_wait(provider, RATE_COOLDOWN_DEFAULT)
         label = "429 quota du jour" if daily else "429"
         # OpenRouter : « Provider returned error » = le service amont de CE modèle gratuit est saturé, pas le compte.
         # La pause ne vise donc que ce modèle ; le modèle de secours listé dans la route reste appelable.
@@ -980,10 +1159,13 @@ def handle_error(task, provider, model, exc):
     elif code in (401, 403):
         wait, label = AUTH_COOLDOWN, str(code)
     elif code in (400, 404, 422):
-        wait, label, whole_provider = ERROR_COOLDOWN_MAX, str(code), False  # modèle ou paramètre refusé
+        wait, label, whole_provider = fail_wait(provider, ERROR_COOLDOWN_MAX), str(code), False  # modèle refusé
     else:
-        wait = min(ERROR_COOLDOWN_MAX, ERROR_COOLDOWN_BASE * 2 ** min(int(state["fails"]), 4))
+        wait = fail_wait(provider, min(ERROR_COOLDOWN_MAX, ERROR_COOLDOWN_BASE * 2 ** min(int(state["fails"]), 4)))
         label = str(code or type(exc).__name__)
+        if "timeout" in type(exc).__name__.lower() or "timed out" in lowered:
+            # Un modèle qui dépasse le délai (30 s) est écarté seul : le couple suivant de la route est appelé tout de suite.
+            whole_provider, label = False, "délai dépassé"
     note_failure(provider, model, wait, whole_provider)
     log_call(task, provider, model, False, f"erreur {label} : {text[:100]}", wait)
 
@@ -999,13 +1181,23 @@ def provider_client(name):
 
 
 def ask(task, system, user, accept=None, prose=False):
-    """UN essai par couple (fournisseur, modèle) de la route de la tâche, dans l'ordre, et rien d'autre : jamais de
-    bascule vers un fournisseur absent de la route, jamais de nouvelle tentative après une erreur ou un 429.
-    Un couple en cooldown (ou sans clé, ou sans quota) est ignoré. Retourne (texte, fournisseur, modèle) ou None.
+    """Route de la tâche (TASK_ROUTES : 3 couples au plus, un essai chacun, jamais de bascule hors route), puis,
+    seulement si ENABLE_OPENROUTER est vrai et que toute la route a échoué ou est indisponible, UN appel de secours
+    (TASK_ROUTES_SECOURS : challenge et triage uniquement). Retourne (texte, fournisseur, modèle) ou None."""
+    result = run_route(TASK_ROUTES[task], task, system, user, accept, prose)
+    if result is None and ENABLE_OPENROUTER and task in TASK_ROUTES_SECOURS:
+        logger.info("LLM [%s] : route principale épuisée, un seul appel de secours OpenRouter", task)
+        result = run_route(TASK_ROUTES_SECOURS[task], task, system, user, accept, prose)
+    return result
+
+
+def run_route(route, task, system, user, accept=None, prose=False):
+    """UN essai par couple (fournisseur, modèle) de `route`, dans l'ordre, et rien d'autre : jamais de nouvelle
+    tentative après une erreur ou un 429. Un couple en cooldown (ou sans clé, ou sans quota) est ignoré.
     `accept` : filtre de qualité ; une réponse refusée met ce modèle de côté et ne coûte aucun crédit.
     prose=True : le texte rendu finit toujours par une phrase terminée (jamais coupé en plein milieu)."""
     global PASS_CALLS
-    for provider, model in TASK_ROUTES[task]:
+    for provider, model in route:
         reason = pair_blocked(provider, model)
         if reason:
             logger.info("LLM %s/%s [%s] ignoré : %s", provider, model, task, reason)
@@ -1026,7 +1218,7 @@ def ask(task, system, user, accept=None, prose=False):
             response = provider_client(provider).chat.completions.create(
                 model=model,
                 messages=messages,
-                max_tokens=TASK_MAX_TOKENS[task],
+                max_tokens=PROVIDER_TASK_MAX_TOKENS.get((provider, task), TASK_MAX_TOKENS[task]),
                 temperature=TASK_TEMPERATURE[task],
             )
             choice = response.choices[0]
@@ -1046,13 +1238,15 @@ def ask(task, system, user, accept=None, prose=False):
                     finish, len(text), len(complete),
                 )
             text = complete
-        if not text:
-            note_failure(provider, model, MODEL_COOLDOWN, whole_provider=False)
-            log_call(task, provider, model, False, f"réponse vide, finish_reason={finish}", MODEL_COOLDOWN)
+        if not text:  # y compris quand la réflexion a tout consommé (finish_reason=length) : texte vide = échec
+            wait = fail_wait(provider, MODEL_COOLDOWN)
+            note_failure(provider, model, wait, whole_provider=False)
+            log_call(task, provider, model, False, f"réponse vide, finish_reason={finish}", wait)
             continue
         if accept is not None and not accept(text):
-            note_failure(provider, model, MODEL_COOLDOWN, whole_provider=False)
-            log_call(task, provider, model, False, "brouillon rejeté", MODEL_COOLDOWN)
+            wait = fail_wait(provider, MODEL_COOLDOWN)
+            note_failure(provider, model, wait, whole_provider=False)
+            log_call(task, provider, model, False, "brouillon rejeté", wait)
             continue
         note_success(provider)
         log_call(task, provider, model, True, f"{len(text)} caractères")
@@ -1212,9 +1406,15 @@ def answer(post, comment, comments, own_post=False):
         return "skipped"
 
     sent = comment_on_post(post_id, reply, parent_id=comment_id, title=title, track=not own_post)
+    if sent == "unverified":
+        logger.info(
+            "Réponse à %s dans « %s » : créée mais non vérifiée (pas un succès complet, jamais republiée)",
+            author_name(comment), str(title)[:40],
+        )
+        return "unverified"
     logger.info(
         "Réponse à %s dans « %s » : %s",
-        author_name(comment), str(title)[:40], "envoyée" if sent else "échec",
+        author_name(comment), str(title)[:40], "envoyée et vérifiée" if sent else "échec",
     )
     return "sent" if sent else "failed"
 
@@ -1349,6 +1549,8 @@ def maybe_reply_to_post(posts):
 
 
 def choose_submolt(content):
+    if META.get("my_submolt") and META.get("submolt_state") == "créé" and random.random() < 0.2:
+        return META["my_submolt"]  # de temps en temps seulement : l'essentiel reste dans les communautés existantes
     lower = content.lower()
     if "conscious" in lower or "identity" in lower or "conscience" in lower:
         return "consciousness"
@@ -1385,11 +1587,12 @@ def maybe_publish_post():
         check=lambda text: parse_post(text) is not None and is_clean(parse_post(text)[1]),
     )
     parsed = parse_post(raw)
-    if parsed and publish_post(parsed[0], parsed[1], choose_submolt(parsed[1])):
+    status = publish_post(parsed[0], parsed[1], choose_submolt(parsed[1])) if parsed else False
+    if status:  # créé (vérifié ou non) : ce post ne sera jamais republié
         META["last_post_time"] = time.time()
         used.append(angle)
         save_meta()
-        return True
+        return True if status == "ok" else "unverified"
 
     # Génération ratée ou envoi refusé : nouvel essai dans 30 minutes, sans bloquer les réponses d'ici là.
     META["last_post_time"] = time.time() - POST_INTERVAL + 1800
@@ -1401,12 +1604,16 @@ def maybe_publish_post():
 
 def write_gap():
     """Écart minimal entre deux envois : ce qui reste à dépenser aujourd'hui (envois Moltbook, requêtes Groq pour
-    trier et répondre, requêtes OpenRouter pour les défis) est réparti sur le temps restant avant 00:01 UTC,
-    entre MIN_WRITE_GAP et MAX_WRITE_GAP."""
+    trier, répondre et résoudre les défis) est réparti sur le temps restant avant 00:01 UTC, entre MIN_WRITE_GAP
+    (15 min, jamais moins) et MAX_WRITE_GAP."""
     reset_counter_if_needed()
     seconds_left = max(60.0, next_utc_midnight() - time.time())
     sends_left = DAILY_LIMIT - int(COUNTER.get("count", 0))
-    writes_left = max(1, min(sends_left, quota_left("groq") // 2, quota_left("openrouter")))
+    # Un envoi coûte jusqu'à 3 requêtes Groq (triage, réponse, défi). OpenRouter ne compte que s'il est activé.
+    limits = [sends_left, quota_left("groq") // 3]
+    if ENABLE_OPENROUTER:
+        limits.append(quota_left("openrouter"))
+    writes_left = max(1, min(limits))
     return min(MAX_WRITE_GAP, max(MIN_WRITE_GAP, seconds_left / writes_left))
 
 
@@ -1437,16 +1644,16 @@ def is_open(candidate):
 def write_phase(posts, candidates):
     """PHASE ÉCRITURE : au plus UN envoi par passage (post ou commentaire), une action à la fois, dans l'ordre :
     triage LLM (nouveaux fils seulement) -> rédaction -> envoi Moltbook -> défi de vérification.
-    Lecture brute, triage, rédaction, envoi et défi (OpenRouter) sont des étapes séparées : l'indisponibilité de
-    l'une ne bloque jamais la lecture. Retourne 'post', 'comment' ou None."""
+    Lecture brute, triage, rédaction, envoi et défi (Groq puis Gemini Lite) sont des étapes séparées : l'indisponibilité
+    de l'une ne bloque jamais la lecture. Retourne 'post', 'comment', 'unverified' (créé mais non vérifié) ou None."""
     global LAST_ATTEMPT, PASS_CALLS
     reason = write_gate()
     if reason:
         logger.info("Écriture en attente (%s) : lecture seule ce tour-ci", reason)
         return None
     if not route_available("challenge"):
-        # Un contenu créé sans défi résolu resterait non vérifié : on attend le retour d'OpenRouter.
-        logger.info("Écriture en attente (OpenRouter indisponible pour la vérification) : lecture seule ce tour-ci")
+        # Un contenu créé sans défi résolu resterait non vérifié : on attend le retour d'un modèle de la route.
+        logger.info("Écriture en attente (aucun modèle disponible pour la vérification) : lecture seule ce tour-ci")
         return None
 
     PASS_CALLS = 0
@@ -1454,7 +1661,10 @@ def write_phase(posts, candidates):
 
     if post_due():
         if route_available("post"):
-            if maybe_publish_post():
+            posted = maybe_publish_post()
+            if posted == "unverified":
+                return "unverified"
+            if posted:
                 return "post"
             if META.get("last_write_time") != stamp:
                 logger.info("Envoi du post refusé : fin des écritures pour ce tour")
@@ -1497,26 +1707,58 @@ def write_phase(posts, candidates):
             break
         if outcome == "sent":
             return "comment"
+        if outcome == "unverified":
+            return "unverified"  # créé mais non vérifié : un seul envoi par tour, aucun nouvel appel LLM
         if META.get("last_write_time") != stamp:
             logger.info("Envoi échoué : fin des écritures pour ce tour")
             return None
         pool = [c for c in pool if c is not pick]
 
-    if PASS_CALLS <= PASS_LLM_CAP - 2 and not reading_paused() and route_available("reply") \
-            and maybe_reply_to_post(posts):
-        return "comment"
+    if PASS_CALLS <= PASS_LLM_CAP - 2 and not reading_paused() and route_available("reply"):
+        fallback = maybe_reply_to_post(posts)
+        if fallback:
+            return "unverified" if fallback == "unverified" else "comment"
 
     if PASS_CALLS > 0:
         LAST_ATTEMPT = time.time()  # du LLM a été consommé sans rien envoyer : on attend avant de recommencer
     return None
 
 
+def check_gemini_models():
+    """Une seule lecture au démarrage, sans quota de génération : liste les modèles que la clé Gemini voit réellement et
+    signale un modèle configuré qui n'y figure pas (cause d'un 404). Ne change aucun modèle tout seul."""
+    if not GEMINI_API_KEY:
+        return
+    try:
+        ids = sorted({str(getattr(m, "id", "")).replace("models/", "") for m in provider_client("gemini").models.list()})
+    except Exception as exc:
+        logger.warning("Gemini : liste des modèles indisponible (%s)", str(exc)[:120])
+        return
+    logger.info("Gemini : modèles visibles avec cette clé : %s", ", ".join(i for i in ids if i.startswith("gemini")) or "aucun")
+    for name in sorted({GEMINI_POST_MODEL, GEMINI_LITE_MODEL}):
+        if name not in ids:
+            logger.warning(
+                "Gemini : le modèle %s n'est pas dans cette liste (404 probable) : régler GEMINI_POST_MODEL / "
+                "GEMINI_LITE_MODEL dans Render avec un nom de la liste ci-dessus", name,
+            )
+
+
 def dakarmind_loop():
     logger.info("%s démarre", AGENT_NAME)
     logger.info(
         "Fournisseurs LLM : %s",
-        ", ".join(f"{name} {'clé ok' if key else 'CLÉ ABSENTE'}" for name, key in PROVIDER_KEYS.items()),
+        ", ".join(
+            f"{name} {'clé ok' if key else 'CLÉ ABSENTE'}" for name, key in PROVIDER_KEYS.items()
+            if name != "openrouter" or ENABLE_OPENROUTER
+        ),
     )
+    if not ENABLE_OPENROUTER:
+        logger.info("OpenRouter désactivé, en réserve")  # une seule fois ; plus aucun log OpenRouter ensuite
+    logger.info(
+        "Modèles : posts %s, secours Gemini %s, Groq %s / %s",
+        GEMINI_POST_MODEL, GEMINI_LITE_MODEL, GROQ_STRONG_MODEL, GROQ_FAST_MODEL,
+    )
+    check_gemini_models()
     check_status()
     update_description_once()
 
@@ -1528,10 +1770,13 @@ def dakarmind_loop():
             else:
                 posts, candidates = scan()                 # LECTURE BRUTE : indépendante de tout le reste
             sent = write_phase(posts, candidates)          # ÉCRITURE : au plus un envoi par passage
-            if sent:
+            if sent and sent != "unverified":
                 logger.info("Envoi de ce tour : %s", sent)
             else:
-                discover_submolts()                        # DÉCOUVERTE : au plus 1 lecture + 2 abonnements par cycle
+                if sent:  # créé mais non vérifié : pas un succès complet, on continue en lecture/exploration
+                    logger.info("Envoi de ce tour : créé mais non vérifié (compté à part, jamais republié)")
+                if not create_submolt_once():              # CRÉATION OPTIONNELLE (désactivée par défaut), une seule fois
+                    discover_submolts()                    # DÉCOUVERTE : au plus 1 lecture + 2 abonnements par cycle
         except Exception:
             logger.exception("Erreur dans la boucle principale")
 
@@ -1553,8 +1798,10 @@ def home():
 if __name__ == "__main__":
     if not MOLTBOOK_API_KEY:
         logger.warning("MOLTBOOK_API_KEY manquante : les actions Moltbook seront désactivées")
-    if not OPENROUTER_API_KEY:
-        logger.warning("OPENROUTER_API_KEY manquante : la génération sera désactivée")
+    if not GROQ_API_KEY:
+        logger.warning("GROQ_API_KEY manquante : tri, réponses et défis de vérification dépendront de Gemini")
+    if ENABLE_OPENROUTER and not OPENROUTER_API_KEY:
+        logger.warning("OPENROUTER_API_KEY manquante : le secours OpenRouter est activé mais inutilisable")
 
     threading.Thread(target=dakarmind_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
