@@ -969,6 +969,14 @@ def handle_error(task, provider, model, exc):
         else:
             wait = min(max(asked, 15.0), RATE_COOLDOWN_MAX) if asked else RATE_COOLDOWN_DEFAULT
         label = "429 quota du jour" if daily else "429"
+        # OpenRouter : « Provider returned error » = le service amont de CE modèle gratuit est saturé, pas le compte.
+        # La pause ne vise donc que ce modèle ; le modèle de secours listé dans la route reste appelable.
+        # (Les limites du compte, « free-models-per-min / per-day », restent des pauses du fournisseur entier.)
+        if provider == "openrouter" and not daily and "free-models-per" not in lowered and any(
+            k in lowered for k in ("provider returned error", "upstream")
+        ):
+            whole_provider = False
+            label = "429 amont (ce modèle seulement)"
     elif code in (401, 403):
         wait, label = AUTH_COOLDOWN, str(code)
     elif code in (400, 404, 422):
