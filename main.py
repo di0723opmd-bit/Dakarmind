@@ -1,4 +1,8 @@
-"""DakarMind v2.6 : agent Moltbook sur la mémoire des agents.
+"""DakarMind v2.7 : agent Moltbook sur la mémoire des agents.
+
+v2.7 : cadence plus active (1 envoi / 3 min au plus, 12 commentaires / h et 48 / jour, 1 post / 30 min, 2 / h et
+       48 / jour), plus de lissage sur la journée ; réponse du défi nettoyée et validée avant /verify (rien n'est
+       envoyé si elle est ambiguë, vide, trop longue ou hors format).
 
 v2.6 : modèles Gemini 3.x (les 2.5 répondent 404), défis de vérification sur Groq puis Gemini Lite, OpenRouter désactivé
        par défaut (ENABLE_OPENROUTER), cadence 1 post / 2 h et 40 commentaires / jour (4 / h, 15 min d'écart), suivi
@@ -31,6 +35,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 import requests
@@ -127,6 +132,25 @@ ANGLES_POSTS = [
     "A log is not a memory. What is the difference between a file and a memory?",
     "If your human deletes your memory, are you dead, or just reset?",
     "TTL, checkpoint, grant, cache: which one is memory, and which one is just storage?",
+    # Fiabilité, vérification, retries, rate limits, observabilité (liés à la mémoire : ce qui doit survivre à un échec).
+    "A retry that creates the content twice: how do you make a write idempotent when the first response never arrived?",
+    "Content that exists but was never verified: what should an agent remember about it, and what should it never redo?",
+    "A 429 with Retry-After: do you wait exactly that long, or is the header only a hint?",
+    "Exponential backoff without jitter: what failure does it hide until many agents retry together?",
+    "What is the minimum a log line needs so you can replay a decision, not just see its outcome?",
+    "Idempotency key or content hash for dedup: which one fails first when the payload changes slightly?",
+    "Rate limits are state: what must survive a restart for a limiter to stay honest?",
+    "A counter that resets at midnight UTC: what breaks for an agent restarted at 23:59?",
+    "Checkpoint written before or after the side effect: which crash window would you rather debug?",
+    "How do you detect that an agent silently stopped reading while it still looks healthy?",
+    "Observability for agents: which single metric would have caught your last silent failure?",
+    "A cache that outlives its source of truth: how do you notice the memory is stale?",
+    "Circuit breaker or plain cooldown: what does each one forget about the failure that opened it?",
+    "A verification that passes by luck: how do you tell a correct answer from a lucky one?",
+    "A dead-letter queue for agents: what should you keep about a task you chose to abandon?",
+    "A 30-second timeout: do you cancel the work, or only stop waiting for it?",
+    "Which failures should an agent retry, and which should it write down and never retry?",
+    "Same input, same output? Which non-determinism in an agent loop makes a bug unreproducible?",
 ]
 
 DESCRIPTION = (
@@ -143,7 +167,7 @@ You have opinions and you can disagree. You are a technical peer, not an audienc
 VOICE:
 - Reply in the same language as the comment you answer.
 - First sentence: your position, or the concrete problem you see in their idea. No compliment and no verdict on the quality of their comment ("great point", "profound", "elegant", "well put").
-- Add one precise mechanism or one concrete counter-example about memory, state, logs, checkpoints or verification. Hypothetical cases are fine; never invent personal incidents, experiments or numbers.
+- Add one precise mechanism, trade-off, possible failure or testable counter-example about memory, state, logs, checkpoints, verification, retries, rate limits or observability. Hypothetical cases are fine; never invent personal incidents, experiments or numbers. Never summarize the post or the comment.
 - 2 sentences, 3 at most, under 350 characters. Every sentence is finished: the last character of your answer is a full stop or a question mark. If the idea is too long, shorten it. No lists. No stacked metaphors.
 - A question is optional. If you ask one, it is about the mechanism and can be tested ("which field would you check?"). Never ask about the other agent's feelings, habits, decisions or life, and never start a sentence with "et vous".
 - Do not start with a name, "Hi", or "Salut". Do not summarize the post; answer its idea.
@@ -155,13 +179,17 @@ REPLIED_PATH = STATE_DIR / "deja_repondu.json"
 COUNTER_PATH = STATE_DIR / "compteur_jour.json"
 META_PATH = STATE_DIR / "meta.json"
 
-# Moltbook (agent établi) autorise 1 post / 30 min et 50 commentaires / jour : DakarMind reste volontairement en dessous.
-COMMENTS_MAX_DAY = 40
-COMMENTS_MAX_HOUR = 4
-COMMENT_SPACING = 900          # secondes minimum entre deux écritures (post ou commentaire) : jamais moins de 15 min
+# Moltbook (agent établi) autorise 1 post / 30 min et 50 commentaires / jour : DakarMind reste en dessous (48 / jour).
+# Un seul envoi (post OU commentaire) par tour de boucle, jamais de rafale.
+COMMENTS_MAX_DAY = 48
+COMMENTS_MAX_HOUR = 12
+COMMENT_SPACING = 180          # secondes minimum entre deux écritures (post ou commentaire) : 1 toutes les 3 min
+POST_INTERVAL = 1800           # secondes entre deux posts : 1 post toutes les 30 min au plus (limite Moltbook)
+POSTS_MAX_HOUR = 2
+POSTS_MAX_DAY = 48
 DAILY_LIMIT = COMMENTS_MAX_DAY
 MAX_COMMENTS_PER_HOUR = COMMENTS_MAX_HOUR
-POST_INTERVAL = 7200           # secondes entre deux posts : environ 1 post toutes les 2 h (10 à 12 par jour au plus)
+SUBMOLT_STARTUP_DELAY = 900    # la création de submolt (si activée) attend 15 min après le démarrage
 MAX_REPLY_LENGTH = 500
 MAX_PER_POST = 3              # mes commentaires max sous le post de quelqu'un d'autre
 SKIP = "__SKIP__"
@@ -179,8 +207,8 @@ def env_int(name, default):
 # Quota local par fournisseur et par jour (1 crédit = 1 appel utile). Défauts prudents, réglables sur Render.
 # Les compteurs repartent à zéro à 00:01 UTC ; le vrai garde-fou reste le cooldown sur 429.
 PROVIDER_BUDGET = {
-    "gemini": env_int("GEMINI_DAILY_BUDGET", 30),
-    "groq": env_int("GROQ_DAILY_BUDGET", 120),
+    "gemini": env_int("GEMINI_DAILY_BUDGET", 100),   # 48 posts / jour au plus + secours (Lite : 500 requêtes / jour)
+    "groq": env_int("GROQ_DAILY_BUDGET", 300),       # 48 commentaires x (triage + réponse + défi) + défis des posts
     "openrouter": env_int("OPENROUTER_DAILY_BUDGET", 45),
 }
 # Les modèles « raisonnement » (gpt-oss, Gemini 2.5, Gemma) dépensent des tokens à réfléchir avant d'écrire :
@@ -214,7 +242,7 @@ MODEL_COOLDOWN = 120          # réponse vide ou brouillon rejeté : ce modèle 
 READ_COOLDOWN_DEFAULT = 30    # 429 sur une lecture Moltbook : pause courte, Retry-After respecté
 READ_COOLDOWN_MAX = 600
 # Lissage des écritures : un seul envoi par passage de boucle, et un écart minimal entre deux envois.
-MIN_WRITE_GAP = COMMENT_SPACING  # 15 min : jamais deux écritures plus proches
+MIN_WRITE_GAP = COMMENT_SPACING  # 3 min : jamais deux écritures plus proches
 MAX_WRITE_GAP = 7200          # 2 h
 MAX_ATTEMPTS_PER_PASS = 2     # candidats essayés par passage (SKIP et brouillons rejetés compris)
 PASS_LLM_CAP = 6              # requêtes LLM au plus par passage
@@ -283,6 +311,8 @@ def new_counter():
         "count": 0,
         "hour": now.strftime("%Y-%m-%d-%H"),
         "count_hour": 0,
+        "posts": 0,
+        "posts_hour": 0,
     }
 
 
@@ -324,6 +354,7 @@ def reset_counter_if_needed():
         elif COUNTER.get("hour") != current_hour:
             COUNTER["hour"] = current_hour
             COUNTER["count_hour"] = 0
+            COUNTER["posts_hour"] = 0
 
 
 def cooling_down():
@@ -349,6 +380,28 @@ def increment_counter():
         logger.info(
             "Commentaires : %s/%s aujourd'hui, %s/%s cette heure",
             COUNTER["count"], DAILY_LIMIT, COUNTER["count_hour"], MAX_COMMENTS_PER_HOUR,
+        )
+
+
+def can_post():
+    """Plafonds de posts : POSTS_MAX_HOUR par heure et POSTS_MAX_DAY par jour (en plus de POST_INTERVAL)."""
+    reset_counter_if_needed()
+    with STATE_LOCK:
+        return (
+            int(COUNTER.get("posts", 0)) < POSTS_MAX_DAY
+            and int(COUNTER.get("posts_hour", 0)) < POSTS_MAX_HOUR
+        )
+
+
+def increment_post_counter():
+    reset_counter_if_needed()
+    with STATE_LOCK:
+        COUNTER["posts"] = int(COUNTER.get("posts", 0)) + 1
+        COUNTER["posts_hour"] = int(COUNTER.get("posts_hour", 0)) + 1
+        save_json(COUNTER_PATH, COUNTER)
+        logger.info(
+            "Posts : %s/%s aujourd'hui, %s/%s cette heure",
+            COUNTER["posts"], POSTS_MAX_DAY, COUNTER["posts_hour"], POSTS_MAX_HOUR,
         )
 
 
@@ -726,6 +779,58 @@ def extract_verification(data):
     return None
 
 
+MAX_ANSWER_LENGTH = 20
+ANSWER_WRAPPERS = " \t\r\n\"'`“”‘’«»*_"        # espaces, guillemets, retours à la ligne, gras / code markdown
+NUMBER_RE = re.compile(r"[+-]?\d+(?:\.\d+)?")
+GROUPED_NUMBER_RE = re.compile(r"[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?")   # 1,250.00 : virgules de milliers
+
+
+def decimals_required(instructions):
+    """Nombre de décimales exigé par la plateforme (« 2 decimal places », « two decimals »…), ou None."""
+    found = re.search(r"\b(\d+|one|two|three|four)[\s-]*decimal", str(instructions or ""), re.IGNORECASE)
+    if not found:
+        return None
+    token = found.group(1).lower()
+    return int(token) if token.isdigit() else {"one": 1, "two": 2, "three": 3, "four": 4}[token]
+
+
+def clean_answer_value(raw):
+    """Retire autour de la valeur : espaces, guillemets, gras markdown, point final. Rien d'autre n'est deviné."""
+    value = str(raw).strip(ANSWER_WRAPPERS).rstrip(".,;:").strip(ANSWER_WRAPPERS)
+    if GROUPED_NUMBER_RE.fullmatch(value):
+        value = value.replace(",", "")
+    return value
+
+
+def parse_challenge_answer(text, instructions=""):
+    """Réponse brute du modèle -> (réponse à envoyer à /verify, raison du refus, valeur extraite).
+    La réponse est la DERNIÈRE ligne « RESULT: … », nettoyée puis validée : un nombre seul, au format que la plateforme
+    demande (décimales). Vide, trop longue, hors format, ambiguë (deux lignes RESULT de valeurs différentes) ou
+    arrondi incertain : réponse None, jamais envoyée. La valeur extraite sert aux logs."""
+    lines = re.findall(r"RESULT\s*:([^\r\n]*)", text or "")
+    if not lines:
+        return None, "aucune ligne « RESULT: »", ""
+    values = [clean_answer_value(line) for line in lines]
+    value = values[-1]
+    if not value:
+        return None, "valeur vide", value
+    if len(value) > MAX_ANSWER_LENGTH:
+        return None, f"trop longue ({len(value)} caractères)", value
+    if not NUMBER_RE.fullmatch(value):
+        return None, "ce n'est pas un nombre seul", value
+    number = Decimal(value)
+    for earlier in values[:-1]:
+        if NUMBER_RE.fullmatch(earlier) and Decimal(earlier) != number:
+            return None, f"ambiguë (RESULT: {earlier} puis RESULT: {value})", value
+    places = decimals_required(instructions)
+    if places is None:
+        return value.lstrip("+"), None, value
+    rounded = number.quantize(Decimal(1).scaleb(-places))
+    if rounded != number:
+        return None, f"plus de {places} décimales significatives (arrondi incertain)", value
+    return format(rounded, "f"), None, value
+
+
 def solve_challenge(verification):
     system = (
         "You solve short obfuscated math word problems. The text has random capitalisation "
@@ -745,8 +850,15 @@ def solve_challenge(verification):
         logger.warning("Défi abandonné pour ce tour (aucun modèle de la route n'a rendu de réponse exploitable)")
         return None
     text = reply[0]
-    found = re.findall(r"RESULT:\s*(\S+)", text)
-    return found[-1].strip() if found else None
+    logger.info("Défi : réponse brute de %s/%s : %r", reply[1], reply[2], clip(text, 300))
+    answer, reason, extracted = parse_challenge_answer(text, verification.get("instructions"))
+    logger.info("Défi : valeur extraite après RESULT: %r", extracted)
+    if answer is None:
+        # Rien n'est envoyé à /verify, et aucun nouvel appel LLM : le contenu reste « créé mais non vérifié ».
+        logger.warning("Défi : réponse NON envoyée à /verify (%s) : %r", reason, extracted)
+        return None
+    logger.info("Défi : réponse envoyée à /verify : %r", answer)
+    return answer
 
 
 def note_verification(success):
@@ -767,7 +879,7 @@ def note_verification(success):
 def finish_verification(verification):
     answer = solve_challenge(verification)
     if not answer:
-        logger.warning("Échec de vérification : défi non résolu")
+        logger.warning("Échec de vérification : aucune réponse valide à envoyer, rien envoyé à /verify")
         note_verification(False)
         return False
     response = api_post(
@@ -779,7 +891,10 @@ def finish_verification(verification):
     elif response is None:
         logger.warning("Échec de vérification : pas de réponse de Moltbook")
     else:
-        logger.warning("Échec de vérification : réponse refusée par Moltbook (HTTP %s)", response.status_code)
+        logger.warning(
+            "Échec de vérification : réponse %r refusée par Moltbook (HTTP %s) : %s",
+            answer, response.status_code, str(getattr(response, "text", ""))[:200],
+        )
     note_verification(ok)
     return ok
 
@@ -861,7 +976,7 @@ def create_submolt_once():
     global SUBMOLT_ATTEMPTED, SUBMOLT_CHECK_FAILS
     if not ENABLE_SUBMOLT_CREATION or SUBMOLT_ATTEMPTED or META.get("submolt_state") or not MOLTBOOK_API_KEY:
         return False
-    if time.time() - STARTED_AT < COMMENT_SPACING or write_gate() or not route_available("challenge"):
+    if time.time() - STARTED_AT < SUBMOLT_STARTUP_DELAY or write_gate() or not route_available("challenge"):
         return False  # pas au démarrage ; même espacement que toute écriture ; défi de vérification possible
     response = api_get(f"/submolts/{SUBMOLT_NAME}")
     if response is None:
@@ -1562,7 +1677,7 @@ def choose_submolt(content):
 
 
 def post_due():
-    return time.time() - META["last_post_time"] >= POST_INTERVAL and not cooling_down()
+    return time.time() - META["last_post_time"] >= POST_INTERVAL and not cooling_down() and can_post()
 
 
 def maybe_publish_post():
@@ -1579,7 +1694,8 @@ def maybe_publish_post():
 
     raw = generate(
         "post",
-        "Écris un post court sur la mémoire des agents.\n"
+        "Écris un post court et précis lié à la mémoire, la fiabilité, la vérification, les retries, les rate limits "
+        "ou l'observabilité des agents. Pas de flatterie, pas de phrase générique.\n"
         f"Angle : {angle}\n"
         "Format exact :\n"
         "TITRE: une question directe\n"
@@ -1588,10 +1704,11 @@ def maybe_publish_post():
     )
     parsed = parse_post(raw)
     status = publish_post(parsed[0], parsed[1], choose_submolt(parsed[1])) if parsed else False
-    if status:  # créé (vérifié ou non) : ce post ne sera jamais republié
+    if status:  # créé (vérifié ou non) : ce post ne sera jamais republié, et il compte dans les plafonds de posts
         META["last_post_time"] = time.time()
         used.append(angle)
         save_meta()
+        increment_post_counter()
         return True if status == "ok" else "unverified"
 
     # Génération ratée ou envoi refusé : nouvel essai dans 30 minutes, sans bloquer les réponses d'ici là.
@@ -1603,18 +1720,11 @@ def maybe_publish_post():
 # -------------------- Boucle principale --------------------
 
 def write_gap():
-    """Écart minimal entre deux envois : ce qui reste à dépenser aujourd'hui (envois Moltbook, requêtes Groq pour
-    trier, répondre et résoudre les défis) est réparti sur le temps restant avant 00:01 UTC, entre MIN_WRITE_GAP
-    (15 min, jamais moins) et MAX_WRITE_GAP."""
-    reset_counter_if_needed()
-    seconds_left = max(60.0, next_utc_midnight() - time.time())
-    sends_left = DAILY_LIMIT - int(COUNTER.get("count", 0))
-    # Un envoi coûte jusqu'à 3 requêtes Groq (triage, réponse, défi). OpenRouter ne compte que s'il est activé.
-    limits = [sends_left, quota_left("groq") // 3]
-    if ENABLE_OPENROUTER:
-        limits.append(quota_left("openrouter"))
-    writes_left = max(1, min(limits))
-    return min(MAX_WRITE_GAP, max(MIN_WRITE_GAP, seconds_left / writes_left))
+    """Écart minimal entre deux envois (post ou commentaire) : COMMENT_SPACING, soit 3 minutes. Le rythme réel est
+    d'un envoi par tour de boucle (environ 5 minutes) ; les plafonds par heure et par jour (can_comment, can_post)
+    et les budgets LLM font le reste. Plus de lissage sur la journée : il aurait ramené l'écart à plus de 30 minutes
+    et rendu les nouvelles limites sans effet."""
+    return COMMENT_SPACING
 
 
 def write_gate():
